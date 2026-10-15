@@ -24,12 +24,19 @@ jobs:
         run: |
           cargo build --release 2>&1 | Tee-Object -FilePath build.log
           if ($LASTEXITCODE -ne 0) {
-            # Surface the important lines as an annotation so they're readable without the raw log.
-            $lines = Select-String -Path build.log -Pattern 'error(\[E\d+\])?:|-->|LNK\d{4}|CMake Error|fatal error|warning: llama|cargo:warning' -Context 0,3 |
-              Select-Object -First 25 | ForEach-Object { ($_.Line + "`n" + ($_.Context.PostContext -join "`n")) }
-            $msg = ($lines -join "`n----`n") -replace '%','%25' -replace "`r",'' -replace "`n",'%0A'
-            if ($msg.Length -gt 60000) { $msg = $msg.Substring(0, 60000) }
-            Write-Output "::error title=Build errors::$msg"
+            # Report the useful lines as short annotations (GitHub truncates long ones).
+            $hits = Get-Content build.log | Where-Object {
+              ($_ -match 'error(\[E\d+\])?:|LNK\d{4}|unresolved external|CMake Error|fatal error') -and ($_.Length -lt 2000)
+            } | Select-Object -First 40
+            $chunk = ''
+            $n = 0
+            foreach ($h in $hits) {
+              if (($chunk.Length + $h.Length) -gt 900 -and $chunk.Length -gt 0) {
+                $n++; Write-Output ("::error title=Build errors $n::" + ($chunk -replace '%','%25' -replace "`n",'%0A')); $chunk = ''
+              }
+              $chunk += $h.Substring(0, [Math]::Min($h.Length, 900)) + "`n"
+            }
+            if ($chunk.Length -gt 0) { $n++; Write-Output ("::error title=Build errors $n::" + ($chunk -replace '%','%25' -replace "`n",'%0A')) }
             exit 1
           }
 
