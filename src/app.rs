@@ -1,15 +1,16 @@
 use crate::ai::{self, AiCoach, Msg};
 use crate::analyzer::{Analyzer, LiveFrame, FRAME};
-use crate::audio::{self, AudioInput};
+use crate::audio::{self, AudioInput, Player};
 use crate::content::{GUIDES, PASSAGES, QUICK_PHRASES};
 use crate::dsp::cracks::Crack;
 use crate::dsp::notes::{format_cents, hz_to_note, note_name};
 use crate::session::{self, find_passaggio, resonance_word, Frame, Goal, Passaggio, Stats, Target};
 use crate::storage::{self, HistoryEntry, Settings};
 use crate::theme::{self, bold, Pal};
-use crate::widgets::{self, card, chip, ghost_button, muted, primary_button, segmented, title};
+use crate::widgets::{self, card, chip, ghost_button, muted, primary_button, segmented, title, Mood, View};
 use eframe::egui::{self, vec2, Align, Key, Layout, RichText, Ui};
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -29,17 +30,20 @@ const TABS: [(Tab, &str); 5] = [
     (Tab::Settings, "Settings"),
 ];
 
+const LIVE_WINDOW: f32 = 12.0;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Practice,
     Passaggio,
 }
 
+/// A session being recorded. Times are relative to its start.
 struct Running {
     mode: Mode,
-    started: Instant,
-    last_analysis: Instant,
+    t0: f32,
     frames: Vec<Frame>,
+    points: Vec<(f32, Option<f32>)>,
     cracks: Vec<Crack>,
 }
 
@@ -47,7 +51,10 @@ struct Summary {
     stats: Stats,
     tips: Vec<String>,
     target: Target,
-    recording: Option<(Vec<f32>, u32)>,
+    points: Vec<(f32, Option<f32>)>,
+    cracks: Vec<Crack>,
+    duration: f32,
+    recording: Option<(Arc<Vec<f32>>, u32)>,
     ai_text: String,
 }
 
@@ -64,25 +71,48 @@ pub struct App {
     settings: Settings,
     history: Vec<HistoryEntry>,
     tab: Tab,
+    tab_changed: Instant,
     devices: Vec<String>,
+
+    // live microphone
     audio: Option<AudioInput>,
+    audio_device: Option<Option<String>>,
+    last_open_attempt: Option<Instant>,
+    clock: Instant,
     analyzer: Analyzer,
     buf: Vec<f32>,
-    running: Option<Running>,
+    last_analysis: Instant,
     live: LiveFrame,
+    peak_hold: (f32, Instant),
     graph: VecDeque<(f32, Option<f32>)>,
     graph_cracks: Vec<Crack>,
+    graph_whole: bool,
+    in_range_since: Option<Instant>,
+    last_crack_at: Option<Instant>,
+
+    // sessions
+    running: Option<Running>,
     summary: Option<Summary>,
+    player: Option<Player>,
+    play_pos: f32,
     passaggio_result: Option<Passaggio>,
     toast: Option<(String, Instant)>,
     error: Option<String>,
+
+    // AI coach
     ai: AiCoach,
     ai_state: AiState,
     ai_installed: bool,
     ai_message: Option<String>,
+
     guide: usize,
     phrase: usize,
     confirm_clear: bool,
+}
+
+fn mmss(s: f32) -> String {
+    let s = s.max(0.0) as u32;
+    format!("{}:{:02}", s / 60, s % 60)
 }
 
 impl App {
@@ -91,21 +121,33 @@ impl App {
         let settings = storage::load_settings();
         let pal = theme::resolve(&settings.theme);
         theme::install(&cc.egui_ctx, &pal);
+        let now = Instant::now();
         App {
             pal,
             applied_dark: Some(pal.dark),
-            last_theme_check: Instant::now(),
-            analyzer: Analyzer::new(settings.gate_db),
+            last_theme_check: now,
             history: storage::load_history(),
             tab: Tab::Practice,
+            tab_changed: now,
             devices: audio::list_devices(),
             audio: None,
+            audio_device: None,
+            last_open_attempt: None,
+            clock: now,
+            analyzer: Analyzer::new(settings.gate_db),
             buf: Vec::with_capacity(FRAME),
-            running: None,
-            live: LiveFrame::default(),
+            last_analysis: now,
+            live: LiveFrame { peak_db: -100.0, db: -100.0, ..Default::default() },
+            peak_hold: (-100.0, now),
             graph: VecDeque::new(),
             graph_cracks: Vec::new(),
+            graph_whole: false,
+            in_range_since: None,
+            last_crack_at: None,
+            running: None,
             summary: None,
+            player: None,
+            play_pos: 0.0,
             passaggio_result: None,
             toast: None,
             error: None,
@@ -128,6 +170,10 @@ impl App {
         storage::save_settings(&self.settings);
     }
 
+    fn now_t(&self) -> f32 {
+        self.clock.elapsed().as_secs_f32()
+    }
+
     // ---------- theme ----------
 
     fn refresh_theme(&mut self, ctx: &egui::Context, force: bool) {
@@ -141,35 +187,134 @@ impl App {
         }
     }
 
+    // ---------- microphone ----------
+
+    fn want_mic(&self) -> bool {
+        self.running.is_some() || (self.settings.live_mic && matches!(self.tab, Tab::Practice | Tab::Read))
+    }
+
+    fn open_mic(&mut self) -> Result<(), String> {
+        self.last_open_attempt = Some(Instant::now());
+        let a = AudioInput::start(self.settings.mic.as_deref())?;
+        self.audio = Some(a);
+        self.audio_device = Some(self.settings.mic.clone());
+        self.analyzer = Analyzer::new(self.settings.gate_db);
+        self.clock = Instant::now();
+        self.graph.clear();
+        self.graph_cracks.clear();
+        Ok(())
+    }
+
+    fn close_mic(&mut self) {
+        self.audio = None;
+        self.audio_device = None;
+        self.live = LiveFrame { peak_db: -100.0, db: -100.0, ..Default::default() };
+        self.in_range_since = None;
+    }
+
+    /// Opens or closes the mic to match what the current screen needs.
+    fn manage_mic(&mut self) {
+        let want = self.want_mic();
+        if self.audio.is_some() && (!want || self.audio_device.as_ref() != Some(&self.settings.mic)) && self.running.is_none() {
+            self.close_mic();
+        }
+        if want && self.audio.is_none() {
+            let may_retry = self.last_open_attempt.map_or(true, |t| t.elapsed() > Duration::from_secs(4));
+            if may_retry {
+                match self.open_mic() {
+                    Ok(()) => self.error = None,
+                    Err(e) => self.error = Some(e),
+                }
+            }
+        }
+    }
+
+    fn tick_audio(&mut self, ctx: &egui::Context) {
+        let Some(audio) = self.audio.as_ref() else { return };
+        ctx.request_repaint_after(Duration::from_millis(16));
+        if let Some(e) = audio.error() {
+            self.error = Some(format!("Microphone stopped: {e}"));
+        }
+        if self.last_analysis.elapsed() < Duration::from_millis(33) {
+            return;
+        }
+        self.last_analysis = Instant::now();
+        if !audio.latest(FRAME, &mut self.buf) {
+            return;
+        }
+        let t = self.clock.elapsed().as_secs_f32();
+        let f = self.analyzer.analyze(&self.buf, audio.sample_rate, t);
+
+        // peak hold: holds for a second, then falls back
+        let (held, at) = self.peak_hold;
+        if f.peak_db >= held || at.elapsed() > Duration::from_millis(1200) {
+            self.peak_hold = (f.peak_db, Instant::now());
+        }
+
+        let target = self.target();
+        match f.hz {
+            Some(h) if target.contains(h) => {
+                self.in_range_since.get_or_insert_with(Instant::now);
+            }
+            Some(_) => self.in_range_since = None,
+            None => {}
+        }
+
+        if let Some(run) = self.running.as_mut() {
+            let rt = t - run.t0;
+            run.frames.push(Frame { t: rt, hz: f.hz, res: f.res, h1h2: f.h1h2, register: f.register });
+            run.points.push((rt, f.hz));
+            if let Some(c) = f.crack {
+                run.cracks.push(Crack { t: c.t - run.t0, ..c });
+            }
+        }
+        if let Some(c) = f.crack {
+            self.graph_cracks.push(c);
+            self.last_crack_at = Some(Instant::now());
+            if self.running.as_ref().map_or(true, |r| r.mode == Mode::Practice) {
+                let low = c.from_hz.min(c.to_hz);
+                let dir = if c.upward() { "up into head voice" } else { "down into chest voice" };
+                self.toast = Some((
+                    format!("Crack at {} ({dir}). Get a little quieter and lighter as you approach this note.", note_name(low)),
+                    Instant::now(),
+                ));
+            }
+        }
+        self.graph.push_back((t, f.hz));
+        while self.graph.front().is_some_and(|(pt, _)| *pt < t - LIVE_WINDOW - 1.0) {
+            self.graph.pop_front();
+        }
+        self.graph_cracks.retain(|c| c.t > t - LIVE_WINDOW - 1.0);
+        self.live = f;
+    }
+
     // ---------- sessions ----------
 
     fn start(&mut self, mode: Mode) {
         self.error = None;
-        let record = self.settings.record && mode == Mode::Practice;
-        match AudioInput::start(self.settings.mic.as_deref(), record) {
-            Ok(a) => {
-                self.audio = Some(a);
-                self.analyzer = Analyzer::new(self.settings.gate_db);
-                self.graph.clear();
-                self.graph_cracks.clear();
-                self.live = LiveFrame::default();
-                if mode == Mode::Passaggio {
-                    self.passaggio_result = None;
-                }
-                let now = Instant::now();
-                self.running = Some(Running { mode, started: now, last_analysis: now, frames: Vec::new(), cracks: Vec::new() });
+        if self.audio.is_none() {
+            if let Err(e) = self.open_mic() {
+                self.error = Some(e);
+                return;
             }
-            Err(e) => self.error = Some(e),
         }
+        self.player = None;
+        if mode == Mode::Passaggio {
+            self.passaggio_result = None;
+        }
+        if let Some(a) = &self.audio {
+            a.set_recording(self.settings.record && mode == Mode::Practice);
+        }
+        self.running = Some(Running { mode, t0: self.now_t(), frames: Vec::new(), points: Vec::new(), cracks: Vec::new() });
     }
 
     fn stop(&mut self) {
         let Some(run) = self.running.take() else { return };
-        let audio = self.audio.take();
-        let recording = audio.as_ref().and_then(|a| a.take_recording().map(|r| (r, a.sample_rate as u32)));
-        drop(audio);
-        self.live = LiveFrame::default();
-
+        let recording = self.audio.as_ref().and_then(|a| {
+            let r = a.take_recording();
+            a.set_recording(false);
+            r.map(|r| (Arc::new(r), a.sample_rate as u32))
+        });
         match run.mode {
             Mode::Passaggio => {
                 let result = find_passaggio(&run.frames, &run.cracks);
@@ -201,10 +346,15 @@ impl App {
                     self.history.truncate(300);
                     storage::save_history(&self.history);
                 }
+                let duration = run.points.last().map(|p| p.0).unwrap_or(0.0);
+                self.play_pos = 0.0;
                 self.summary = Some(Summary {
                     stats,
                     tips,
                     target,
+                    points: run.points,
+                    cracks: run.cracks,
+                    duration,
                     recording: recording.filter(|(r, _)| !r.is_empty()),
                     ai_text: String::new(),
                 });
@@ -212,42 +362,39 @@ impl App {
         }
     }
 
-    fn tick_audio(&mut self, ctx: &egui::Context) {
-        let Some(run) = self.running.as_mut() else { return };
-        let Some(audio) = self.audio.as_ref() else { return };
-        ctx.request_repaint_after(Duration::from_millis(16));
-        if let Some(e) = audio.error() {
-            self.error = Some(format!("Microphone stopped: {e}"));
-        }
-        if run.last_analysis.elapsed() < Duration::from_millis(33) {
+    fn toggle_play(&mut self) {
+        if let Some(p) = self.player.take() {
+            self.play_pos = p.position_secs();
             return;
         }
-        run.last_analysis = Instant::now();
-        if !audio.latest(FRAME, &mut self.buf) {
-            return;
+        let Some(s) = self.summary.as_ref() else { return };
+        let Some((rec, sr)) = s.recording.clone() else { return };
+        if self.play_pos >= s.duration - 0.05 {
+            self.play_pos = 0.0;
         }
-        let t = run.started.elapsed().as_secs_f32();
-        let f = self.analyzer.analyze(&self.buf, audio.sample_rate, t);
-        run.frames.push(Frame { t, hz: f.hz, res: f.res, h1h2: f.h1h2, register: f.register });
-        if let Some(c) = f.crack {
-            run.cracks.push(c);
-            self.graph_cracks.push(c);
-            if run.mode == Mode::Practice {
-                self.toast = Some((
-                    format!(
-                        "Crack at {} - get a little quieter and lighter as you approach this note.",
-                        note_name(c.from_hz.min(c.to_hz))
-                    ),
-                    Instant::now(),
-                ));
+        match Player::start(rec, sr, self.play_pos) {
+            Ok(p) => self.player = Some(p),
+            Err(e) => self.error = Some(e),
+        }
+    }
+
+    fn seek(&mut self, t: f32) {
+        self.play_pos = t;
+        if self.player.is_some() {
+            self.player = None;
+            self.toggle_play();
+        }
+    }
+
+    fn poll_player(&mut self, ctx: &egui::Context) {
+        if let Some(p) = &self.player {
+            self.play_pos = p.position_secs();
+            if p.finished() {
+                self.player = None;
+                self.play_pos = 0.0;
             }
+            ctx.request_repaint_after(Duration::from_millis(30));
         }
-        self.graph.push_back((t, f.hz));
-        while self.graph.front().is_some_and(|(pt, _)| *pt < t - 13.0) {
-            self.graph.pop_front();
-        }
-        self.graph_cracks.retain(|c| c.t > t - 13.0);
-        self.live = f;
     }
 
     fn poll_ai(&mut self) {
@@ -282,17 +429,32 @@ impl App {
         }
     }
 
+    fn mood(&self) -> Mood {
+        if self.audio.is_none() {
+            Mood::Sleepy
+        } else if self.last_crack_at.is_some_and(|t| t.elapsed() < Duration::from_millis(1600)) {
+            Mood::Oops
+        } else if self.in_range_since.is_some_and(|t| t.elapsed() > Duration::from_millis(2500)) && self.live.hz.is_some() {
+            Mood::Happy
+        } else {
+            Mood::Listening
+        }
+    }
+
     // ---------- top bar ----------
 
     fn top_bar(&mut self, ui: &mut Ui) {
         let p = self.pal;
         ui.horizontal(|ui| {
-            ui.label(RichText::new("OnicVoco").family(bold()).size(22.0));
-            ui.add_space(18.0);
+            let level = ((self.live.db + 60.0) / 45.0).clamp(0.0, 1.0);
+            widgets::mascot(ui, &p, self.mood(), if self.live.hz.is_some() { level } else { 0.0 });
+            ui.label(RichText::new("OnicVoco").family(bold()).size(23.0));
+            ui.add_space(14.0);
             let idx = TABS.iter().position(|(t, _)| *t == self.tab).unwrap_or(0);
             let names: Vec<&str> = TABS.iter().map(|(_, n)| *n).collect();
-            if let Some(i) = segmented(ui, &p, &names, idx) {
+            if let Some(i) = segmented(ui, &p, "tabs", &names, idx) {
                 self.tab = TABS[i].0;
+                self.tab_changed = Instant::now();
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let icon = if p.dark { "☀" } else { "☾" };
@@ -301,8 +463,9 @@ impl App {
                     self.save();
                     self.pal = theme::resolve(&self.settings.theme);
                 }
-                if self.running.is_some() {
-                    chip(ui, &p, "● Listening", true);
+                if let Some(run) = &self.running {
+                    let label = if run.mode == Mode::Passaggio { "● finding passaggio" } else { "● REC" };
+                    chip(ui, &p, &format!("{label} {}", mmss(self.now_t() - run.t0)), true);
                 }
             });
         });
@@ -312,23 +475,18 @@ impl App {
 
     fn start_stop_buttons(&mut self, ui: &mut Ui) {
         let p = self.pal;
-        match self.running.as_ref().map(|r| r.mode) {
-            None => {
-                if primary_button(ui, &p, "Start practice").clicked() {
-                    self.start(Mode::Practice);
-                }
+        if self.running.is_none() {
+            if primary_button(ui, &p, "●  Start recording", false).on_hover_text("Space").clicked() {
+                self.start(Mode::Practice);
             }
-            Some(_) => {
-                if primary_button(ui, &p, "■  Finish").clicked() {
-                    self.stop();
-                }
-            }
+        } else if primary_button(ui, &p, "■  Finish", true).on_hover_text("Space").clicked() {
+            self.stop();
         }
     }
 
     fn status(&self, target: &Target) -> (&'static str, bool) {
-        if self.running.is_none() {
-            return ("Ready", false);
+        if self.audio.is_none() {
+            return ("Mic off", false);
         }
         match self.live.hz {
             Some(h) if target.contains(h) => ("In your range", true),
@@ -353,8 +511,62 @@ impl App {
                 });
                 muted(ui, &p, "If Windows blocked the microphone: Settings > Privacy & security > Microphone > allow desktop apps.");
             });
-            ui.add_space(4.0);
         }
+    }
+
+    fn mic_combo(&mut self, ui: &mut Ui) {
+        let current = self.settings.mic.clone().unwrap_or_else(|| "Default microphone".into());
+        ui.add_enabled_ui(self.running.is_none(), |ui| {
+            egui::ComboBox::new("mic", "").selected_text(current).width(230.0).show_ui(ui, |ui| {
+                let mut sel = self.settings.mic.clone();
+                ui.selectable_value(&mut sel, None, "Default microphone");
+                for d in &self.devices {
+                    ui.selectable_value(&mut sel, Some(d.clone()), d);
+                }
+                if sel != self.settings.mic {
+                    self.settings.mic = sel;
+                    self.save();
+                }
+            });
+        });
+    }
+
+    fn graph_card(&mut self, ui: &mut Ui, target: &Target, height: f32, with_toggle: bool) {
+        let p = self.pal;
+        let now = self.now_t();
+        card(ui, &p, |ui| {
+            ui.horizontal(|ui| {
+                title(ui, "Pitch over time");
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if with_toggle {
+                        let idx = usize::from(self.graph_whole);
+                        if let Some(i) = segmented(ui, &p, "graphview", &["Last 12 s", "Whole session"], idx) {
+                            self.graph_whole = i == 1;
+                        }
+                    }
+                    muted(ui, &p, "thick = in range · ◉ = crack");
+                });
+            });
+            let show_whole = with_toggle && self.graph_whole;
+            if show_whole {
+                let (pts, cracks): (&[(f32, Option<f32>)], &[Crack]) = match (&self.running, &self.summary) {
+                    (Some(r), _) => (&r.points, &r.cracks),
+                    (None, Some(s)) => (&s.points, &s.cracks),
+                    _ => (&[], &[]),
+                };
+                let end = pts.last().map(|p| p.0).unwrap_or(1.0).max(1.0);
+                let live_now = self.running.as_ref().map(|r| now - r.t0);
+                widgets::pitch_graph(ui, &p, pts, cracks, target, self.settings.passaggio_hz, height, View { start: 0.0, end }, live_now, None);
+                if pts.is_empty() {
+                    muted(ui, &p, "Start a recording and the whole session will fit here.");
+                }
+            } else {
+                let pts: Vec<(f32, Option<f32>)> = self.graph.iter().cloned().collect();
+                let end = if self.audio.is_some() { now } else { pts.last().map(|p| p.0).unwrap_or(LIVE_WINDOW) };
+                let view = View { start: end - LIVE_WINDOW, end };
+                widgets::pitch_graph(ui, &p, &pts, &self.graph_cracks, target, self.settings.passaggio_hz, height, view, Some(now), None);
+            }
+        });
     }
 
     // ---------- Practice ----------
@@ -368,22 +580,8 @@ impl App {
             ui.horizontal_wrapped(|ui| {
                 ui.vertical(|ui| {
                     muted(ui, &p, "Microphone");
-                    let current = self.settings.mic.clone().unwrap_or_else(|| "Default microphone".into());
-                    let enabled = self.running.is_none();
-                    ui.add_enabled_ui(enabled, |ui| {
-                        egui::ComboBox::new("mic", "").selected_text(current).width(230.0).show_ui(ui, |ui| {
-                            let mut sel = self.settings.mic.clone();
-                            ui.selectable_value(&mut sel, None, "Default microphone");
-                            for d in &self.devices {
-                                ui.selectable_value(&mut sel, Some(d.clone()), d);
-                            }
-                            if sel != self.settings.mic {
-                                self.settings.mic = sel;
-                                self.save();
-                            }
-                        });
-                    });
-                    if enabled && ui.small_button("Refresh list").clicked() {
+                    self.mic_combo(ui);
+                    if self.running.is_none() && ui.small_button("Refresh list").clicked() {
                         self.devices = audio::list_devices();
                     }
                 });
@@ -392,7 +590,7 @@ impl App {
                     muted(ui, &p, "Goal");
                     let goals: Vec<&str> = Goal::ALL.iter().map(|g| g.label()).collect();
                     let idx = Goal::ALL.iter().position(|g| *g == target.goal).unwrap_or(0);
-                    if let Some(i) = segmented(ui, &p, &goals, idx) {
+                    if let Some(i) = segmented(ui, &p, "goal", &goals, idx) {
                         self.settings.goal = Goal::ALL[i].key().into();
                         self.save();
                     }
@@ -430,15 +628,7 @@ impl App {
             self.resonance_card(&mut cols[1], &target);
         });
 
-        card(ui, &p, |ui| {
-            ui.horizontal(|ui| {
-                title(ui, "Pitch over time");
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    muted(ui, &p, "last 12 s · thick line = in range · ◉ = crack");
-                });
-            });
-            widgets::pitch_graph(ui, &p, &self.graph, &self.graph_cracks, &target, self.settings.passaggio_hz, 230.0);
-        });
+        self.graph_card(ui, &target, 240.0, true);
 
         card(ui, &p, |ui| {
             ui.horizontal(|ui| {
@@ -458,29 +648,33 @@ impl App {
     fn live_card(&mut self, ui: &mut Ui, target: &Target) {
         let p = self.pal;
         let (status, good) = self.status(target);
+        let ctx = ui.ctx().clone();
         card(ui, &p, |ui| {
             ui.horizontal(|ui| {
                 title(ui, "Pitch");
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| chip(ui, &p, status, good));
             });
             ui.horizontal(|ui| {
+                let voiced = self.live.hz.is_some();
+                let shown = ctx.animate_value_with_time(egui::Id::new("hz-num"), self.live.hz.unwrap_or(0.0), 0.12);
+                let alpha = ctx.animate_bool_with_time(egui::Id::new("hz-on"), voiced, 0.25);
                 let (hz, note, cents) = match self.live.hz {
                     Some(h) => {
                         let n = hz_to_note(h);
-                        (format!("{}", h.round()), n.name, format_cents(n.cents))
+                        (format!("{}", shown.round()), n.name, format_cents(n.cents))
                     }
                     None => ("--".into(), "--".into(), String::new()),
                 };
-                let c = if self.live.hz.is_some() || self.running.is_none() { p.text } else { p.faint };
-                ui.label(RichText::new(hz).family(bold()).size(68.0).color(c));
+                let c = widgets::lerp_color(p.faint, p.text, alpha.max(if self.audio.is_none() { 1.0 } else { 0.0 }));
+                ui.label(RichText::new(hz).family(bold()).size(72.0).color(c));
                 ui.label(RichText::new("Hz").size(18.0).color(p.muted));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(RichText::new(cents).size(16.0).color(p.muted));
-                    ui.label(RichText::new(note).family(bold()).size(36.0).color(c));
+                    ui.label(RichText::new(cents).family(bold()).size(16.0).color(p.muted));
+                    ui.label(RichText::new(note).family(bold()).size(40.0).color(c));
                 });
             });
-            let level = ((self.live.db + 70.0) / 60.0).clamp(0.0, 1.0);
-            widgets::bar(ui, &p, if self.running.is_some() { level } else { 0.0 }, 6.0);
+            let active = self.audio.is_some();
+            widgets::peak_meter(ui, &p, self.live.peak_db, self.peak_hold.0, self.live.db, active);
             muted(
                 ui,
                 &p,
@@ -494,12 +688,18 @@ impl App {
                 ),
             );
             if let Some((msg, at)) = &self.toast {
-                if at.elapsed() < Duration::from_secs(4) {
+                let age = at.elapsed().as_secs_f32();
+                if age < 5.0 {
+                    let a = (age / 0.25).min(1.0) * ((5.0 - age) / 0.5).min(1.0);
                     egui::Frame::none()
-                        .fill(p.card2)
+                        .fill(widgets::fade(p.card2, a))
                         .rounding(egui::Rounding::same(10.0))
                         .inner_margin(egui::Margin::same(10.0))
-                        .show(ui, |ui| ui.label(RichText::new(msg).size(13.5)));
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.label(RichText::new(msg).size(13.5).color(widgets::fade(p.text, a)));
+                        });
+                    ctx.request_repaint();
                 }
             }
         });
@@ -512,13 +712,13 @@ impl App {
                 title(ui, "Register");
                 chip(ui, &p, "estimate", false);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if let Some(h) = self.live.h1h2 {
+                    if let (Some(h), true) = (self.live.h1h2, self.live.hz.is_some()) {
                         muted(ui, &p, format!("H1-H2 {h:.1} dB"));
                     }
                 });
             });
             widgets::register_meter(ui, &p, if self.live.hz.is_some() { self.live.register } else { None });
-            muted(ui, &p, "Based on how strong your first harmonics are. Chest is buzzy, head/falsetto is light and airy, mix sits between.");
+            muted(ui, &p, "Chest is buzzy, head/falsetto is light and airy, mix sits in between. A big jump between them is a crack.");
         });
     }
 
@@ -529,7 +729,7 @@ impl App {
                 title(ui, "Resonance");
                 chip(ui, &p, "estimate", false);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if let Some(f) = self.live.formants {
+                    if let (Some(f), true) = (self.live.formants, self.live.hz.is_some()) {
                         muted(ui, &p, format!("F1 {:.0} · F2 {:.0} Hz", f.f1, f.f2));
                     }
                 });
@@ -554,7 +754,7 @@ impl App {
             });
             match res {
                 Passaggio::Found { hz, via_crack } => {
-                    ui.label(RichText::new(format!("around {} ({} Hz)", note_name(hz), hz.round())).family(bold()).size(28.0));
+                    ui.label(RichText::new(format!("around {} ({} Hz)", note_name(hz), hz.round())).family(bold()).size(30.0));
                     ui.label(if via_crack {
                         "Your voice cracked here on the way up. This is the zone to practise: quiet, light sirens across it."
                     } else {
@@ -562,7 +762,7 @@ impl App {
                     });
                 }
                 Passaggio::Smooth { low_hz, high_hz } => {
-                    ui.label(RichText::new("No clear break found").family(bold()).size(22.0));
+                    ui.label(RichText::new("No clear break found").family(bold()).size(24.0));
                     ui.label(format!(
                         "You glided from {} to {} without an obvious flip. That's a smooth transition! Try going higher, or a little louder, to find it.",
                         note_name(low_hz),
@@ -580,8 +780,13 @@ impl App {
         let p = self.pal;
         let ai_ready = self.ai_installed && self.settings.ai_enabled;
         let thinking = matches!(self.ai_state, AiState::Thinking);
+        let playing = self.player.is_some();
+        let play_pos = self.play_pos;
         let mut ask_ai = None;
         let mut close = false;
+        let mut toggle = false;
+        let mut seek = None;
+        let mut save = false;
         let Some(s) = self.summary.as_ref() else { return };
         card(ui, &p, |ui| {
             ui.horizontal(|ui| {
@@ -590,18 +795,40 @@ impl App {
                     if ghost_button(ui, &p, "Close").clicked() {
                         close = true;
                     }
-                    if let Some((rec, sr)) = &s.recording {
-                        if ghost_button(ui, &p, "Save recording…").clicked() {
-                            let name = format!("onicvoco-{}.wav", chrono::Local::now().format("%Y-%m-%d-%H%M"));
-                            if let Some(path) = rfd::FileDialog::new().set_file_name(name).add_filter("WAV audio", &["wav"]).save_file() {
-                                if let Err(e) = audio::save_wav(&path, rec, *sr) {
-                                    self.error = Some(format!("Couldn't save the recording: {e}"));
-                                }
-                            }
-                        }
+                    if s.recording.is_some() && ghost_button(ui, &p, "Save recording…").clicked() {
+                        save = true;
                     }
                 });
             });
+
+            // The whole recording, fitted to the width, with a playhead.
+            let has_audio = s.recording.is_some();
+            let out = widgets::pitch_graph(
+                ui,
+                &p,
+                &s.points,
+                &s.cracks,
+                &s.target,
+                self.settings.passaggio_hz,
+                170.0,
+                View { start: 0.0, end: s.duration.max(1.0) },
+                None,
+                has_audio.then_some(play_pos),
+            );
+            if has_audio {
+                if let Some(t) = out.clicked_t {
+                    seek = Some(t);
+                }
+                ui.horizontal(|ui| {
+                    let label = if playing { "❚❚  Pause" } else { "▶  Play" };
+                    if ghost_button(ui, &p, label).clicked() {
+                        toggle = true;
+                    }
+                    ui.label(RichText::new(format!("{} / {}", mmss(play_pos), mmss(s.duration))).family(bold()).size(14.0));
+                    muted(ui, &p, "click the graph to jump");
+                });
+            }
+
             let st = &s.stats;
             if st.enough {
                 ui.horizontal_wrapped(|ui| {
@@ -613,7 +840,7 @@ impl App {
                             .show(ui, |ui| {
                                 ui.set_min_width(150.0);
                                 ui.vertical(|ui| {
-                                    ui.label(RichText::new(big).family(bold()).size(22.0));
+                                    ui.label(RichText::new(big).family(bold()).size(24.0));
                                     ui.label(RichText::new(small).size(12.5).color(p.muted));
                                 });
                             });
@@ -630,10 +857,9 @@ impl App {
                         stat(main.into(), format!("mostly · {:.0}/{:.0}/{:.0}% c/m/h", c * 100.0, m * 100.0, h * 100.0));
                     }
                     stat(format!("{}", st.cracks), "voice cracks".into());
-                    stat(format!("{} s", st.voiced_s.round()), "voiced time".into());
+                    stat(mmss(st.voiced_s), "voiced time".into());
                 });
             }
-            ui.add_space(6.0);
             for tip in &s.tips {
                 egui::Frame::none()
                     .fill(p.card2)
@@ -645,7 +871,6 @@ impl App {
                     });
             }
             if ai_ready && st.enough {
-                ui.add_space(6.0);
                 egui::Frame::none()
                     .stroke(egui::Stroke::new(1.0_f32, p.faint))
                     .rounding(egui::Rounding::same(12.0))
@@ -669,8 +894,26 @@ impl App {
                     });
             }
         });
+
+        if save {
+            if let Some((rec, sr)) = self.summary.as_ref().and_then(|s| s.recording.clone()) {
+                let name = format!("onicvoco-{}.wav", chrono::Local::now().format("%Y-%m-%d-%H%M"));
+                if let Some(path) = rfd::FileDialog::new().set_file_name(name).add_filter("WAV audio", &["wav"]).save_file() {
+                    if let Err(e) = audio::save_wav(&path, &rec, sr) {
+                        self.error = Some(format!("Couldn't save the recording: {e}"));
+                    }
+                }
+            }
+        }
+        if let Some(t) = seek {
+            self.seek(t);
+        }
+        if toggle {
+            self.toggle_play();
+        }
         if close {
             self.summary = None;
+            self.player = None;
         }
         if let Some(prompt) = ask_ai {
             if let Some(s) = self.summary.as_mut() {
@@ -697,8 +940,8 @@ impl App {
                     Some(h) => (format!("{} Hz", h.round()), hz_to_note(h).name),
                     None => ("-- Hz".into(), "--".into()),
                 };
-                ui.label(RichText::new(hz).family(bold()).size(26.0));
-                ui.label(RichText::new(note).family(bold()).size(26.0).color(p.muted));
+                ui.label(RichText::new(hz).family(bold()).size(28.0));
+                ui.label(RichText::new(note).family(bold()).size(28.0).color(p.muted));
                 chip(ui, &p, status, good);
                 if let (Some(r), true) = (self.live.register, self.live.hz.is_some()) {
                     chip(ui, &p, r.label(), false);
@@ -707,14 +950,15 @@ impl App {
                     chip(ui, &p, resonance_word(r), false);
                 }
             });
-            widgets::pitch_graph(ui, &p, &self.graph, &self.graph_cracks, &target, self.settings.passaggio_hz, 120.0);
+            widgets::peak_meter(ui, &p, self.live.peak_db, self.peak_hold.0, self.live.db, self.audio.is_some());
         });
+        self.graph_card(ui, &target, 130.0, false);
 
         let idx = self.settings.passage.min(PASSAGES.len() - 1);
         let passage = &PASSAGES[idx];
         card(ui, &p, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new(passage.title).family(bold()).size(20.0));
+                ui.label(RichText::new(passage.title).family(bold()).size(22.0));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ghost_button(ui, &p, "Next →").clicked() {
                         self.settings.passage = (idx + 1) % PASSAGES.len();
@@ -741,7 +985,7 @@ impl App {
                     }
                 });
             });
-            ui.label(RichText::new(QUICK_PHRASES[self.phrase]).family(bold()).size(26.0));
+            ui.label(RichText::new(QUICK_PHRASES[self.phrase]).family(bold()).size(28.0));
             muted(ui, &p, "Say it three times: once normally, once with more melody, once softer and lighter.");
         });
 
@@ -756,7 +1000,7 @@ impl App {
             ui.horizontal_wrapped(|ui| {
                 for (i, g) in GUIDES.iter().enumerate() {
                     let on = i == self.guide;
-                    let b = egui::Button::new(RichText::new(g.title).family(bold()).size(14.0).color(if on { p.on_text } else { p.text }))
+                    let b = egui::Button::new(RichText::new(g.title).family(bold()).size(14.5).color(if on { p.on_text } else { p.text }))
                         .fill(if on { p.text } else { p.card2 })
                         .rounding(egui::Rounding::same(99.0));
                     if ui.add(b).clicked() {
@@ -767,7 +1011,7 @@ impl App {
         });
         let g = &GUIDES[self.guide];
         card(ui, &p, |ui| {
-            ui.label(RichText::new(g.title).family(bold()).size(28.0));
+            ui.label(RichText::new(g.title).family(bold()).size(30.0));
             ui.label(RichText::new(g.summary).size(17.0).color(p.muted));
             ui.add_space(8.0);
             for para in g.body {
@@ -784,7 +1028,7 @@ impl App {
                     .inner_margin(egui::Margin::same(14.0))
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                        ui.label(RichText::new(*name).family(bold()).size(16.0));
+                        ui.label(RichText::new(*name).family(bold()).size(16.5));
                         ui.label(RichText::new(*how).size(15.0).line_height(Some(23.0)));
                     });
             }
@@ -798,14 +1042,14 @@ impl App {
         if self.history.is_empty() {
             card(ui, &p, |ui| {
                 title(ui, "Progress");
-                muted(ui, &p, "Finish a practice session and your progress will show up here. Everything stays on this computer.");
+                muted(ui, &p, "Finish a recording and your progress will show up here. Everything stays on this computer.");
             });
             return;
         }
         card(ui, &p, |ui| {
             title(ui, "Median pitch over your last sessions");
             let pts: Vec<f32> = self.history.iter().take(30).rev().map(|h| h.median_hz).collect();
-            trend(ui, &p, &pts, 120.0);
+            trend(ui, &p, &pts, 130.0);
         });
         card(ui, &p, |ui| {
             ui.horizontal(|ui| {
@@ -854,7 +1098,7 @@ impl App {
             let opts = ["System", "Light", "Dark"];
             let keys = ["system", "light", "dark"];
             let idx = keys.iter().position(|k| *k == self.settings.theme).unwrap_or(0);
-            if let Some(i) = segmented(ui, &p, &opts, idx) {
+            if let Some(i) = segmented(ui, &p, "theme", &opts, idx) {
                 self.settings.theme = keys[i].into();
                 self.save();
                 self.refresh_theme(ctx, true);
@@ -862,6 +1106,12 @@ impl App {
         });
         card(ui, &p, |ui| {
             title(ui, "Microphone");
+            if ui
+                .checkbox(&mut self.settings.live_mic, "Keep the microphone live on Practice and Read (pitch and peak meter without recording)")
+                .changed()
+            {
+                self.save();
+            }
             ui.horizontal(|ui| {
                 ui.label("Noise gate");
                 if ui.add(egui::Slider::new(&mut self.settings.gate_db, -70.0..=-25.0).suffix(" dB")).changed() {
@@ -870,7 +1120,7 @@ impl App {
                 }
             });
             muted(ui, &p, "Raise it if background noise shows up as pitch. Lower it if quiet speech is ignored.");
-            if ui.checkbox(&mut self.settings.record, "Keep a recording of each practice session so I can play it back or save it").changed() {
+            if ui.checkbox(&mut self.settings.record, "Keep the audio of each recording so I can play it back or save it").changed() {
                 self.save();
             }
             muted(ui, &p, "Recordings stay in memory until you save them. Nothing is uploaded.");
@@ -908,23 +1158,21 @@ impl App {
                 }
                 None => {
                     if self.ai_installed {
-                        ui.horizontal(|ui| {
-                            if ui.checkbox(&mut self.settings.ai_enabled, "Show the AI coach in session summaries").changed() {
-                                self.save();
-                            }
-                        });
-                        if ghost_button(ui, &p, "Remove model from this computer").clicked() {
+                        if ui.checkbox(&mut self.settings.ai_enabled, "Show the AI coach in session summaries").changed() {
+                            self.save();
+                        }
+                        if ghost_button(ui, &p, "Remove AI coach from this computer").clicked() {
                             match ai::remove() {
                                 Ok(()) => {
                                     self.ai_installed = false;
                                     self.settings.ai_enabled = false;
                                     self.save();
-                                    self.ai_message = Some("Model removed.".into());
+                                    self.ai_message = Some("AI coach removed.".into());
                                 }
                                 Err(e) => self.ai_message = Some(format!("Couldn't remove it: {e}")),
                             }
                         }
-                    } else if primary_button(ui, &p, "Download AI coach").clicked() {
+                    } else if primary_button(ui, &p, "Download AI coach", false).clicked() {
                         self.ai_state = AiState::Downloading(0.0, "starting".into());
                         self.ai_message = None;
                         self.ai.download();
@@ -945,12 +1193,13 @@ impl App {
 /// Simple line chart for the progress tab.
 fn trend(ui: &mut Ui, p: &Pal, pts: &[f32], height: f32) {
     use eframe::egui::{pos2, Align2, FontId, Sense, Stroke};
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
     if pts.len() < 2 {
         muted(ui, p, "Do a couple more sessions to see a trend.");
         return;
     }
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
     let painter = ui.painter_at(rect);
+    let grow = ui.ctx().animate_value_with_time(egui::Id::new("trend-grow"), 1.0, 0.6);
     let lo = pts.iter().cloned().fold(f32::MAX, f32::min) - 10.0;
     let hi = pts.iter().cloned().fold(f32::MIN, f32::max) + 10.0;
     let left = rect.left() + 46.0;
@@ -960,7 +1209,8 @@ fn trend(ui: &mut Ui, p: &Pal, pts: &[f32], height: f32) {
         painter.line_segment([pos2(left, y(v)), pos2(rect.right(), y(v))], Stroke::new(0.5_f32, p.stroke));
         painter.text(pos2(rect.left(), y(v)), Align2::LEFT_CENTER, format!("{} Hz", v.round()), FontId::proportional(11.0), p.muted);
     }
-    let line: Vec<_> = pts.iter().enumerate().map(|(i, &v)| pos2(x(i), y(v))).collect();
+    let n = ((pts.len() as f32) * grow).ceil().max(2.0) as usize;
+    let line: Vec<_> = pts.iter().take(n).enumerate().map(|(i, &v)| pos2(x(i), y(v))).collect();
     painter.add(egui::Shape::line(line.clone(), Stroke::new(2.0_f32, p.text)));
     for pt in line {
         painter.circle_filled(pt, 3.0, p.text);
@@ -970,15 +1220,14 @@ fn trend(ui: &mut Ui, p: &Pal, pts: &[f32], height: f32) {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.refresh_theme(ctx, false);
+        self.manage_mic();
         self.tick_audio(ctx);
+        self.poll_player(ctx);
         self.poll_ai();
-        if self.toast.as_ref().is_some_and(|(_, at)| at.elapsed() < Duration::from_secs(5)) {
-            ctx.request_repaint_after(Duration::from_millis(500));
-        }
         if !matches!(self.ai_state, AiState::Idle) {
             ctx.request_repaint_after(Duration::from_millis(200));
         }
-        // Space bar starts/stops a practice session when not typing.
+        // Space bar starts/stops a recording when not typing.
         if !ctx.wants_keyboard_input() && ctx.input(|i| i.key_pressed(Key::Space)) && matches!(self.tab, Tab::Practice | Tab::Read) {
             if self.running.is_some() {
                 self.stop();
@@ -993,11 +1242,16 @@ impl eframe::App for App {
             .show_separator_line(false)
             .show(ctx, |ui| self.top_bar(ui));
 
+        let appear = (self.tab_changed.elapsed().as_secs_f32() / 0.3).min(1.0);
+        if appear < 1.0 {
+            ctx.request_repaint();
+        }
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(p.bg).inner_margin(egui::Margin { left: 24.0, right: 24.0, top: 4.0, bottom: 0.0 }))
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 14.0;
+                    widgets::appear(ui, appear);
                     match self.tab {
                         Tab::Practice => self.practice(ui),
                         Tab::Read => self.read(ui),

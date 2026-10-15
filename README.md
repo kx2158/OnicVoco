@@ -4,19 +4,22 @@ Gentle, private voice training. A fully native Windows app written in Rust: no b
 
 ## Features
 
+- **Always-live mic** with a **peak meter** (peak hold + "too loud" warning), so you see pitch and level without recording
 - **Live pitch** in Hz and scientific pitch notation (G3 +4¢), with a status for your goal range
 - **Goals**: feminine, androgynous, masculine or a custom range
 - **Register meter**: chest, mix / passaggio, head / falsetto (estimated from H1-H2)
 - **Find my passaggio**: glide low to high and the app finds where your voice changes gear, then marks it on the graph and note strip
-- **Voice crack detection**: cracks are marked on the pitch graph, counted in your summary, with tips right when they happen
+- **Voice crack detection**: sudden jumps between falsetto and chest (either direction) are marked on the pitch graph with a little pop, counted in your summary, with tips right when they happen
 - **Resonance meter** (darker to brighter), estimated from formants
 - **Read tab**: practice passages and quick phrases with a live meter on top
 - **Learn tab**: chest voice, head voice and falsetto, passaggio, mix, resonance, voice cracks, safe practice, with exercises
-- **Session summary**, recording playback/saving (WAV) and **progress history**, all stored only on your computer
+- **Pitch graph** with very light semitone lines, a "Last 12 s" or "Whole session" view
+- **Session summary** showing the whole recording fitted to the width, with in-app **playback** and a playhead (click to jump), WAV saving, and **progress history**, all stored only on your computer
 - **Optional AI coach** that turns your session numbers into friendly feedback
-- Monochrome light and dark themes (follows Windows by default)
+- Monochrome light and dark themes (follows Windows by default), smooth animations, Bahnschrift + Segoe UI
+- There may be a small someone living in the top-left corner
 
-Press **Space** to start or finish a session.
+Press **Space** to start or finish a recording.
 
 ## The AI coach
 
@@ -35,7 +38,7 @@ Off by default, and nothing AI related is inside OnicVoco.exe or the installer. 
 | Pitch | YIN on 2048-sample frames, ~30 per second, median-smoothed |
 | Notes | A4 = 440 Hz, middle C = C4 |
 | Register | H1-H2: level difference between the 1st and 2nd harmonic. Low = chest, high = head/falsetto |
-| Cracks | A jump of 4+ semitones between consecutive frames, with stable pitch on both sides |
+| Cracks | The median pitch a few frames before vs. after a break differs by 4.5+ semitones (up or down), allowing a transitional frame or a tiny dropout at the break; breathy falsetto frames are still tracked |
 | Resonance | LPC formant analysis (F1, F2) mapped to a darker-to-brighter score |
 
 Register and resonance are estimates. They shift with vowels and microphones, so watch the trend.

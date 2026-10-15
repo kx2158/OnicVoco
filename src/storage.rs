@@ -13,6 +13,8 @@ pub struct Settings {
     pub custom_max: f32,
     pub gate_db: f32,
     pub record: bool,
+    /// Keep the mic open (live pitch + peak meter) even when not recording.
+    pub live_mic: bool,
     pub mic: Option<String>,
     pub ai_enabled: bool,
     pub passaggio_hz: Option<f32>,
@@ -28,6 +30,7 @@ impl Default for Settings {
             custom_max: 220.0,
             gate_db: -50.0,
             record: true,
+            live_mic: true,
             mic: None,
             ai_enabled: false,
             passaggio_hz: None,

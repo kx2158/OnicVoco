@@ -8,7 +8,9 @@ pub struct Pitch {
 }
 
 pub fn detect(buf: &[f32], sample_rate: f32, min_hz: f32, max_hz: f32) -> Option<Pitch> {
-    let threshold = 0.15f32;
+    // Clean voices dip well below this; breathy falsetto often doesn't.
+    let threshold = 0.2f32;
+    let breathy_limit = 0.4f32;
     let max_tau = ((sample_rate / min_hz) as usize).min(buf.len() / 2);
     let min_tau = ((sample_rate / max_hz) as usize).max(2);
     if max_tau <= min_tau || buf.len() <= max_tau {
@@ -50,7 +52,24 @@ pub fn detect(buf: &[f32], sample_rate: f32, min_hz: f32, max_hz: f32) -> Option
         }
         t += 1;
     }
-    let tau = tau?;
+    // Breathy voices (falsetto!) may never cross the threshold. Fall back to
+    // the deepest dip if it is still clearly periodic.
+    let tau = match tau {
+        Some(t) => t,
+        None => {
+            let (mut best, mut best_v) = (0usize, f32::MAX);
+            for t in min_tau..=max_tau {
+                if cmnd[t] < best_v {
+                    best_v = cmnd[t];
+                    best = t;
+                }
+            }
+            if best_v >= breathy_limit {
+                return None;
+            }
+            best
+        }
+    };
 
     // parabolic interpolation
     let mut better = tau as f32;
@@ -89,6 +108,24 @@ mod tests {
             let p = detect(&vowel(f0, 600.0, 1700.0, SR, 2048), SR as f32, 60.0, 1000.0).expect("pitch");
             assert!(((p.hz as f64 - f0) / f0).abs() < 0.02, "{f0} -> {}", p.hz);
         }
+    }
+
+    #[test]
+    fn breathy_voice_still_tracked() {
+        // A vowel with a lot of noise mixed in, like airy falsetto.
+        let mut seed = 99u32;
+        let v = vowel(330.0, 500.0, 1900.0, SR, 2048);
+        let mixed: Vec<f32> = v
+            .iter()
+            .map(|x| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                x + 0.12 * ((seed as f32 / u32::MAX as f32) * 2.0 - 1.0)
+            })
+            .collect();
+        let p = detect(&mixed, SR as f32, 60.0, 1000.0).expect("pitch");
+        assert!((p.hz - 330.0).abs() / 330.0 < 0.03, "{}", p.hz);
     }
 
     #[test]

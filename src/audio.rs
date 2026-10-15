@@ -30,7 +30,8 @@ pub fn list_devices() -> Vec<String> {
 
 impl AudioInput {
     /// Opens `device` (or the default input) and starts capturing.
-    pub fn start(device: Option<&str>, record: bool) -> Result<Self, String> {
+    /// Recording into memory is off until `set_recording(true)`.
+    pub fn start(device: Option<&str>) -> Result<Self, String> {
         let host = cpal::default_host();
         let dev = match device {
             Some(name) => host
@@ -50,7 +51,7 @@ impl AudioInput {
 
         let shared = Arc::new(Mutex::new(Shared {
             ring: VecDeque::with_capacity(RING),
-            recording: record.then(Vec::new),
+            recording: None,
             peak_error: None,
         }));
 
@@ -124,6 +125,13 @@ impl AudioInput {
         self.shared.lock().ok().and_then(|s| s.peak_error.clone())
     }
 
+    /// Starts (fresh) or stops keeping samples in memory.
+    pub fn set_recording(&self, on: bool) {
+        if let Ok(mut s) = self.shared.lock() {
+            s.recording = on.then(|| Vec::with_capacity(self.sample_rate as usize * 120));
+        }
+    }
+
     pub fn take_recording(&self) -> Option<Vec<f32>> {
         self.shared.lock().ok().and_then(|mut s| s.recording.take())
     }
@@ -142,4 +150,83 @@ pub fn save_wav(path: &std::path::Path, samples: &[f32], sample_rate: u32) -> Re
         w.write_sample((s.clamp(-1.0, 1.0) * 32767.0) as i16).map_err(|e| e.to_string())?;
     }
     w.finalize().map_err(|e| e.to_string())
+}
+
+/// Plays a mono recording on the default output device.
+pub struct Player {
+    _stream: cpal::Stream,
+    /// Current position in source samples, 16.16 fixed point.
+    pos: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    finished: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub source_rate: f32,
+    pub len: usize,
+}
+
+impl Player {
+    pub fn start(samples: std::sync::Arc<Vec<f32>>, source_rate: u32, from_secs: f32) -> Result<Self, String> {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        let host = cpal::default_host();
+        let dev = host.default_output_device().ok_or("No speakers or headphones found.")?;
+        let config = dev.default_output_config().map_err(|e| e.to_string())?;
+        let out_rate = config.sample_rate().0 as f64;
+        let channels = config.channels() as usize;
+        let format = config.sample_format();
+        let stream_config: cpal::StreamConfig = config.into();
+        let step = ((source_rate as f64 / out_rate) * 65536.0) as u64;
+        let start = ((from_secs.max(0.0) as f64 * source_rate as f64) as u64).min(samples.len() as u64) << 16;
+        let pos = std::sync::Arc::new(AtomicU64::new(start));
+        let finished = std::sync::Arc::new(AtomicBool::new(false));
+        let len = samples.len();
+
+        let (p2, f2, s2) = (pos.clone(), finished.clone(), samples.clone());
+        let mut next = move || -> f32 {
+            let fixed = p2.load(Ordering::Relaxed);
+            let i = (fixed >> 16) as usize;
+            if i + 1 >= s2.len() {
+                f2.store(true, Ordering::Relaxed);
+                return 0.0;
+            }
+            let frac = (fixed & 0xFFFF) as f32 / 65536.0;
+            p2.store(fixed + step, Ordering::Relaxed);
+            s2[i] * (1.0 - frac) + s2[i + 1] * frac
+        };
+        let err = |e: cpal::StreamError| eprintln!("playback error: {e}");
+        let stream = match format {
+            cpal::SampleFormat::F32 => dev.build_output_stream(
+                &stream_config,
+                move |d: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                    for frame in d.chunks_mut(channels.max(1)) {
+                        let v = next();
+                        frame.iter_mut().for_each(|x| *x = v);
+                    }
+                },
+                err,
+                None,
+            ),
+            cpal::SampleFormat::I16 => dev.build_output_stream(
+                &stream_config,
+                move |d: &mut [i16], _: &cpal::OutputCallbackInfo| {
+                    for frame in d.chunks_mut(channels.max(1)) {
+                        let v = (next().clamp(-1.0, 1.0) * 32767.0) as i16;
+                        frame.iter_mut().for_each(|x| *x = v);
+                    }
+                },
+                err,
+                None,
+            ),
+            other => return Err(format!("Unsupported speaker sample format: {other:?}")),
+        }
+        .map_err(|e| format!("Could not open the speakers: {e}"))?;
+        stream.play().map_err(|e| e.to_string())?;
+        Ok(Player { _stream: stream, pos, finished, source_rate: source_rate as f32, len })
+    }
+
+    pub fn position_secs(&self) -> f32 {
+        let i = (self.pos.load(std::sync::atomic::Ordering::Relaxed) >> 16) as usize;
+        i.min(self.len) as f32 / self.source_rate
+    }
+
+    pub fn finished(&self) -> bool {
+        self.finished.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }

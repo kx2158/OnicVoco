@@ -1,6 +1,6 @@
 [package]
 name = "onicvoco-coach"
-version = "0.2.0"
+version = "0.3.0"
 description = "Optional on-device AI coach helper for OnicVoco (llama.cpp)"
 edition = "2021"
 license = "MIT"

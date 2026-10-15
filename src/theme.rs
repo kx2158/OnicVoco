@@ -102,19 +102,22 @@ pub fn bold() -> FontFamily {
     FontFamily::Name("bold".into())
 }
 
-/// Uses Segoe UI on Windows so the app looks like a native Windows app.
+/// Native Windows fonts: Segoe UI for body text, and Bahnschrift (a crisp,
+/// DIN-style face that ships with Windows 10/11) for headings and numbers.
 pub fn install_fonts(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
-    let regular = ["C:\\Windows\\Fonts\\segoeui.ttf"];
-    let semibold = ["C:\\Windows\\Fonts\\seguisb.ttf", "C:\\Windows\\Fonts\\segoeuib.ttf"];
     let load = |paths: &[&str]| paths.iter().find_map(|p| std::fs::read(p).ok());
 
-    let mut bold_family = Vec::new();
-    if let Some(bytes) = load(&regular) {
+    if let Some(bytes) = load(&["C:\\Windows\\Fonts\\segoeui.ttf"]) {
         fonts.font_data.insert("segoe".into(), FontData::from_owned(bytes));
         fonts.families.get_mut(&FontFamily::Proportional).unwrap().insert(0, "segoe".into());
     }
-    if let Some(bytes) = load(&semibold) {
+    let mut bold_family = Vec::new();
+    if let Some(bytes) = load(&["C:\\Windows\\Fonts\\bahnschrift.ttf"]) {
+        fonts.font_data.insert("bahn".into(), FontData::from_owned(bytes));
+        bold_family.push("bahn".to_string());
+    }
+    if let Some(bytes) = load(&["C:\\Windows\\Fonts\\seguisb.ttf", "C:\\Windows\\Fonts\\segoeuib.ttf"]) {
         fonts.font_data.insert("segoe-bold".into(), FontData::from_owned(bytes));
         bold_family.push("segoe-bold".to_string());
     }

@@ -12,6 +12,8 @@ const PITCH_FRAME: usize = 2048;
 pub struct LiveFrame {
     pub t: f32,
     pub db: f32,
+    /// Peak sample level in dBFS.
+    pub peak_db: f32,
     /// Median-smoothed pitch.
     pub hz: Option<f32>,
     pub res: Option<f32>,
@@ -51,12 +53,18 @@ impl Analyzer {
 
     /// `buf` must hold the newest FRAME samples.
     pub fn analyze(&mut self, buf: &[f32], sr: f32, t: f32) -> LiveFrame {
-        let mut f = LiveFrame { t, db: rms_db(buf), ..Default::default() };
+        let peak = buf.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let peak_db = if peak > 0.0 { (20.0 * peak.log10()).max(-100.0) } else { -100.0 };
+        let mut f = LiveFrame { t, db: rms_db(buf), peak_db, ..Default::default() };
         let mut raw = None;
         if f.db > self.gate_db {
-            let p = pitch::detect(&buf[buf.len() - PITCH_FRAME..], sr, 60.0, 900.0);
-            if let Some(p) = p.filter(|p| p.clarity > 0.8) {
+            let p = pitch::detect(&buf[buf.len() - PITCH_FRAME..], sr, 60.0, 1000.0);
+            // Breathy frames (lower clarity) still count for crack detection,
+            // which matters for airy falsetto right before a break.
+            if let Some(p) = p.filter(|p| p.clarity > 0.6) {
                 raw = Some(p.hz);
+            }
+            if let Some(p) = p.filter(|p| p.clarity > 0.7) {
                 f.hz = Some(self.stabilise(p.hz));
                 if let Some(fm) = formants::estimate(buf, sr) {
                     let s = formants::resonance_score(fm);
