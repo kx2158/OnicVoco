@@ -11,7 +11,7 @@ use std::collections::VecDeque;
 pub fn card<R>(ui: &mut Ui, p: &Pal, add: impl FnOnce(&mut Ui) -> R) -> R {
     egui::Frame::none()
         .fill(p.card)
-        .stroke(Stroke::new(1.0, p.stroke))
+        .stroke(Stroke::new(1.0_f32, p.stroke))
         .rounding(Rounding::same(16.0))
         .inner_margin(egui::Margin::same(18.0))
         .show(ui, |ui| {
@@ -53,7 +53,7 @@ pub fn ghost_button(ui: &mut Ui, p: &Pal, text: &str) -> egui::Response {
     ui.add(
         egui::Button::new(RichText::new(text).size(14.0))
             .fill(p.card2)
-            .stroke(Stroke::new(1.0, p.stroke))
+            .stroke(Stroke::new(1.0_f32, p.stroke))
             .rounding(Rounding::same(99.0))
             .min_size(vec2(0.0, 34.0)),
     )
@@ -116,21 +116,21 @@ pub fn resonance_meter(ui: &mut Ui, p: &Pal, value: Option<f32>, zone: Option<(f
         let x1 = track.left() + track.width() * (i + 1) as f32 / steps as f32 + 0.5;
         painter.rect_filled(Rect::from_x_y_ranges(x0..=x1, track.y_range()), 0.0, Color32::from_gray(g));
     }
-    painter.rect_stroke(track, Rounding::same(h / 2.0), Stroke::new(1.0, p.stroke));
+    painter.rect_stroke(track, Rounding::same(h / 2.0), Stroke::new(1.0_f32, p.stroke));
     // round the ends by masking corners with the card colour
-    painter.rect_stroke(track.expand(2.0), Rounding::same(h / 2.0 + 2.0), Stroke::new(4.0, p.card));
+    painter.rect_stroke(track.expand(2.0), Rounding::same(h / 2.0 + 2.0), Stroke::new(4.0_f32, p.card));
     if let Some((lo, hi)) = zone {
         let z = Rect::from_x_y_ranges(
             track.left() + track.width() * lo..=track.left() + track.width() * hi,
             track.top() - 4.0..=track.bottom() + 4.0,
         );
         let pts = [z.left_top(), z.right_top(), z.right_bottom(), z.left_bottom(), z.left_top()];
-        painter.extend(Shape::dashed_line(&pts, Stroke::new(1.5, p.text), 5.0, 4.0));
+        painter.extend(Shape::dashed_line(&pts, Stroke::new(1.5_f32, p.text), 5.0, 4.0));
     }
     if let Some(v) = value {
         let c = pos2(track.left() + track.width() * v.clamp(0.0, 1.0), track.center().y);
         painter.circle_filled(c, 11.0, p.card);
-        painter.circle_stroke(c, 11.0, Stroke::new(3.0, p.text));
+        painter.circle_stroke(c, 11.0, Stroke::new(3.0_f32, p.text));
     }
     let y = track.bottom() + 14.0;
     let f = FontId::proportional(12.0);
@@ -196,14 +196,14 @@ pub fn pitch_graph(
             continue;
         }
         let yy = y(midi_to_hz(m as f32));
-        painter.line_segment([pos2(left, yy), pos2(right, yy)], Stroke::new(if pc == 0 { 1.0 } else { 0.5 }, p.stroke));
+        painter.line_segment([pos2(left, yy), pos2(right, yy)], Stroke::new(if pc == 0 { 1.0_f32 } else { 0.5 }, p.stroke));
         painter.text(pos2(rect.left(), yy), Align2::LEFT_CENTER, midi_name(m), f.clone(), p.muted);
     }
 
     // passaggio
     if let Some(ph) = passaggio {
         let yy = y(ph);
-        painter.extend(Shape::dashed_line(&[pos2(left, yy), pos2(right, yy)], Stroke::new(1.2, p.muted), 6.0, 5.0));
+        painter.extend(Shape::dashed_line(&[pos2(left, yy), pos2(right, yy)], Stroke::new(1.2_f32, p.muted), 6.0, 5.0));
         painter.text(pos2(right - 2.0, yy - 8.0), Align2::RIGHT_CENTER, "passaggio", f.clone(), p.muted);
     }
 
@@ -216,7 +216,7 @@ pub fn pitch_graph(
         match hz {
             Some(h) if t >= now - WINDOW_S => {
                 if let Some((pt, ph)) = prev {
-                    let w = if target.contains(h) { 3.0 } else { 1.6 };
+                    let w: f32 = if target.contains(h) { 3.0 } else { 1.6 };
                     painter.line_segment([pos2(x(pt), y(ph)), pos2(x(t), y(h))], Stroke::new(w, p.text));
                 }
                 prev = Some((t, h));
@@ -229,9 +229,9 @@ pub fn pitch_graph(
     for c in cracks.iter().filter(|c| c.t >= now - WINDOW_S) {
         let cx = x(c.t);
         let (y1, y2) = (y(c.from_hz), y(c.to_hz));
-        painter.line_segment([pos2(cx, y1), pos2(cx, y2)], Stroke::new(1.0, p.muted));
+        painter.line_segment([pos2(cx, y1), pos2(cx, y2)], Stroke::new(1.0_f32, p.muted));
         painter.circle_filled(pos2(cx, y2), 4.5, p.text);
-        painter.circle_stroke(pos2(cx, y2), 7.5, Stroke::new(1.0, p.text));
+        painter.circle_stroke(pos2(cx, y2), 7.5, Stroke::new(1.0_f32, p.text));
     }
 }
 
@@ -264,7 +264,7 @@ pub fn note_strip(ui: &mut Ui, p: &Pal, current: Option<i32>, target: &Target, p
             p.card
         };
         painter.rect_filled(r, Rounding::same(7.0), fill);
-        painter.rect_stroke(r, Rounding::same(7.0), Stroke::new(1.0, p.stroke));
+        painter.rect_stroke(r, Rounding::same(7.0), Stroke::new(1.0_f32, p.stroke));
         if pm == Some(m) {
             painter.circle_filled(pos2(r.center().x, r.top() + 8.0), 3.0, if on { p.on_text } else { p.text });
         }

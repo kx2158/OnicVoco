@@ -398,9 +398,9 @@ impl App {
                     }
                     if target.goal == Goal::Custom {
                         ui.horizontal(|ui| {
-                            let a = ui.add(egui::DragValue::new(&mut self.settings.custom_min).clamp_range(50.0..=700.0).suffix(" Hz"));
+                            let a = ui.add(egui::DragValue::new(&mut self.settings.custom_min).range(50.0..=700.0).suffix(" Hz"));
                             ui.label("to");
-                            let b = ui.add(egui::DragValue::new(&mut self.settings.custom_max).clamp_range(50.0..=700.0).suffix(" Hz"));
+                            let b = ui.add(egui::DragValue::new(&mut self.settings.custom_max).range(50.0..=700.0).suffix(" Hz"));
                             if a.changed() || b.changed() {
                                 self.save();
                             }
@@ -647,7 +647,7 @@ impl App {
             if ai_ready && st.enough {
                 ui.add_space(6.0);
                 egui::Frame::none()
-                    .stroke(egui::Stroke::new(1.0, p.faint))
+                    .stroke(egui::Stroke::new(1.0_f32, p.faint))
                     .rounding(egui::Rounding::same(12.0))
                     .inner_margin(egui::Margin::same(14.0))
                     .show(ui, |ui| {
@@ -957,11 +957,11 @@ fn trend(ui: &mut Ui, p: &Pal, pts: &[f32], height: f32) {
     let x = |i: usize| left + (rect.right() - left - 8.0) * i as f32 / (pts.len() - 1) as f32;
     let y = |v: f32| rect.bottom() - 8.0 - (v - lo) / (hi - lo) * (rect.height() - 16.0);
     for v in [lo + 10.0, hi - 10.0] {
-        painter.line_segment([pos2(left, y(v)), pos2(rect.right(), y(v))], Stroke::new(0.5, p.stroke));
+        painter.line_segment([pos2(left, y(v)), pos2(rect.right(), y(v))], Stroke::new(0.5_f32, p.stroke));
         painter.text(pos2(rect.left(), y(v)), Align2::LEFT_CENTER, format!("{} Hz", v.round()), FontId::proportional(11.0), p.muted);
     }
     let line: Vec<_> = pts.iter().enumerate().map(|(i, &v)| pos2(x(i), y(v))).collect();
-    painter.add(egui::Shape::line(line.clone(), Stroke::new(2.0, p.text)));
+    painter.add(egui::Shape::line(line.clone(), Stroke::new(2.0_f32, p.text)));
     for pt in line {
         painter.circle_filled(pt, 3.0, p.text);
     }

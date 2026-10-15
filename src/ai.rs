@@ -148,7 +148,7 @@ mod engine {
     use llama_cpp_2::llama_backend::LlamaBackend;
     use llama_cpp_2::llama_batch::LlamaBatch;
     use llama_cpp_2::model::params::LlamaModelParams;
-    use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaModel};
+    use llama_cpp_2::model::{LlamaChatMessage, LlamaModel};
     use llama_cpp_2::sampling::LlamaSampler;
     use std::num::NonZeroU32;
     use std::path::Path;
@@ -187,7 +187,9 @@ mod engine {
                 .with_n_threads_batch(threads);
             let mut ctx = self.model.new_context(&self.backend, params)?;
 
-            let tokens = self.model.str_to_token(&self.prompt(system, user), AddBos::Never)?;
+            let vocab = self.model.vocab();
+            // Qwen uses no BOS token; parse the chat template's special tokens.
+            let tokens = vocab.tokenize(self.prompt(system, user).as_bytes(), false, true);
             if tokens.is_empty() || tokens.len() > 1500 {
                 return Err(anyhow!("prompt has an unexpected length"));
             }
@@ -209,11 +211,17 @@ mod engine {
             while n_cur < max {
                 let token = sampler.sample(&ctx, batch.n_tokens() - 1);
                 sampler.accept(token);
-                if self.model.is_eog_token(token) {
+                if vocab.is_eog(token) {
                     break;
                 }
-                let piece = self.model.token_to_piece(token, &mut decoder, true, None)?;
-                on_token(piece.replace('—', " - "));
+                // Tokens can split multi-byte characters, so decode as a stream.
+                let bytes = vocab.token_to_piece(token, false, None);
+                let cap = decoder.max_utf8_buffer_length(bytes.len()).unwrap_or(bytes.len() * 3 + 8);
+                let mut piece = String::with_capacity(cap);
+                let _ = decoder.decode_to_string(&bytes, &mut piece, false);
+                if !piece.is_empty() {
+                    on_token(piece.replace('—', " - "));
+                }
                 batch.clear();
                 batch.add(token, n_cur, &[0], true)?;
                 n_cur += 1;

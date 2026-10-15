@@ -56,7 +56,7 @@ pub fn visuals(p: &Pal) -> egui::Visuals {
     v.override_text_color = Some(p.text);
     v.panel_fill = p.bg;
     v.window_fill = p.card;
-    v.window_stroke = Stroke::new(1.0, p.stroke);
+    v.window_stroke = Stroke::new(1.0_f32, p.stroke);
     v.extreme_bg_color = p.card2;
     v.faint_bg_color = p.card2;
     v.code_bg_color = p.card2;
@@ -64,21 +64,21 @@ pub fn visuals(p: &Pal) -> egui::Visuals {
     v.window_rounding = Rounding::same(14.0);
     v.menu_rounding = Rounding::same(10.0);
     v.selection.bg_fill = p.faint;
-    v.selection.stroke = Stroke::new(1.0, p.text);
+    v.selection.stroke = Stroke::new(1.0_f32, p.text);
     v.slider_trailing_fill = true;
 
     let r = Rounding::same(10.0);
     let w = &mut v.widgets;
     w.noninteractive.bg_fill = p.card;
     w.noninteractive.weak_bg_fill = p.card;
-    w.noninteractive.bg_stroke = Stroke::new(1.0, p.stroke);
-    w.noninteractive.fg_stroke = Stroke::new(1.0, p.text);
+    w.noninteractive.bg_stroke = Stroke::new(1.0_f32, p.stroke);
+    w.noninteractive.fg_stroke = Stroke::new(1.0_f32, p.text);
     w.noninteractive.rounding = r;
     for (ws, fill) in [(&mut w.inactive, p.card2), (&mut w.hovered, p.stroke), (&mut w.active, p.faint), (&mut w.open, p.card2)] {
         ws.bg_fill = fill;
         ws.weak_bg_fill = fill;
-        ws.bg_stroke = Stroke::new(1.0, p.stroke);
-        ws.fg_stroke = Stroke::new(1.5, p.text);
+        ws.bg_stroke = Stroke::new(1.0_f32, p.stroke);
+        ws.fg_stroke = Stroke::new(1.5_f32, p.text);
         ws.rounding = r;
         ws.expansion = 0.0;
     }
