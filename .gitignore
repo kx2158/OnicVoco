@@ -1,4 +1,5 @@
 target/
+target-coach/
 dist/
 *.part
 .DS_Store

@@ -24,14 +24,24 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build release
-        run: cargo build --release
+      - name: Build app
+        run: cargo build --release -p onicvoco
+
+      - name: Build AI coach helper
+        env:
+          RUSTFLAGS: -C target-feature=-crt-static
+        run: cargo build --release -p onicvoco-coach --target-dir target-coach
 
       - name: Package portable exe
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item target/release/onicvoco.exe "dist/OnicVoco-${{ inputs.version }}-portable.exe"
+          # AI coach helper + the Visual C++ runtime DLLs it needs (app-local copies).
+          Copy-Item target-coach/release/onicvoco-coach.exe dist/onicvoco-coach.exe
+          foreach ($dll in 'vcruntime140.dll','vcruntime140_1.dll','msvcp140.dll') {
+            Copy-Item "$env:WINDIR\System32\$dll" "dist/coach-$dll"
+          }
 
       - name: Build installer
         shell: pwsh
@@ -55,6 +65,12 @@ jobs:
             - `OnicVoco-${{ inputs.version }}-portable.exe` - single file, just run it
 
             Windows may show "Windows protected your PC" because the app isn't code-signed yet. Click **More info > Run anyway**.
+
+            The `onicvoco-coach.exe` and `coach-*.dll` files are the optional AI coach. You don't need to download them yourself: the app fetches them when you press **Download AI coach** in Settings.
           files: |
             dist/OnicVoco-${{ inputs.version }}-setup.exe
             dist/OnicVoco-${{ inputs.version }}-portable.exe
+            dist/onicvoco-coach.exe
+            dist/coach-vcruntime140.dll
+            dist/coach-vcruntime140_1.dll
+            dist/coach-msvcp140.dll

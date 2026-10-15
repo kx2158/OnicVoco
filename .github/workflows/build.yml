@@ -17,12 +17,37 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Unit tests (audio analysis)
-        run: cargo test --no-default-features
+        run: cargo test -p onicvoco
 
       - name: Build release
         shell: pwsh
         run: |
-          cargo build --release 2>&1 | Tee-Object -FilePath build.log
+          cargo build --release -p onicvoco 2>&1 | Tee-Object -FilePath build.log
+          if ($LASTEXITCODE -ne 0) {
+            # Report the useful lines as short annotations (GitHub truncates long ones).
+            $hits = Get-Content build.log | Where-Object {
+              ($_ -match 'error(\[E\d+\])?:|LNK\d{4}|unresolved external|CMake Error|fatal error') -and ($_.Length -lt 2000)
+            } | Select-Object -First 40
+            $chunk = ''
+            $n = 0
+            foreach ($h in $hits) {
+              if (($chunk.Length + $h.Length) -gt 900 -and $chunk.Length -gt 0) {
+                $n++; Write-Output ("::error title=Build errors $n::" + ($chunk -replace '%','%25' -replace "`n",'%0A')); $chunk = ''
+              }
+              $chunk += $h.Substring(0, [Math]::Min($h.Length, 900)) + "`n"
+            }
+            if ($chunk.Length -gt 0) { $n++; Write-Output ("::error title=Build errors $n::" + ($chunk -replace '%','%25' -replace "`n",'%0A')) }
+            exit 1
+          }
+
+      # The optional AI helper. llama.cpp is built against the dynamic C runtime,
+      # so this overrides the static-CRT setting used for the main app.
+      - name: Build AI coach helper
+        env:
+          RUSTFLAGS: -C target-feature=-crt-static
+        shell: pwsh
+        run: |
+          cargo build --release -p onicvoco-coach --target-dir target-coach 2>&1 | Tee-Object -FilePath build.log
           if ($LASTEXITCODE -ne 0) {
             # Report the useful lines as short annotations (GitHub truncates long ones).
             $hits = Get-Content build.log | Where-Object {
@@ -43,4 +68,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: OnicVoco-windows
-          path: target/release/onicvoco.exe
+          path: |
+            target/release/onicvoco.exe
+            target-coach/release/onicvoco-coach.exe

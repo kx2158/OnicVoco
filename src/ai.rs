@@ -1,14 +1,32 @@
-//! Optional AI coach. Downloads a small model once, then runs it on the CPU
-//! with llama.cpp in a background thread. It never receives audio, only the
-//! session summary numbers.
+//! Optional AI coach.
+//!
+//! Nothing AI related ships inside OnicVoco.exe. When the user asks for it,
+//! the app downloads a small helper program (onicvoco-coach.exe, built from
+//! the `coach/` folder and attached to the GitHub release) plus the language
+//! model. To get feedback it starts the helper in the background, sends it the
+//! session numbers on stdin and reads the answer back. The helper never
+//! receives audio.
 
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::mpsc::{channel, Receiver, Sender};
 
 const MODEL_FILE: &str = "qwen2.5-0.5b-instruct-q4_k_m.gguf";
 const MODEL_URL: &str =
     "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf";
-pub const MODEL_SIZE_MB: u32 = 490;
+const RELEASE_BASE: &str = "https://github.com/kx2158/OnicVoco/releases/latest/download/";
+const HELPER_EXE: &str = "onicvoco-coach.exe";
+
+/// (asset name on the release, file name on disk)
+const HELPER_FILES: &[(&str, &str)] = &[
+    ("onicvoco-coach.exe", "onicvoco-coach.exe"),
+    ("coach-vcruntime140.dll", "vcruntime140.dll"),
+    ("coach-vcruntime140_1.dll", "vcruntime140_1.dll"),
+    ("coach-msvcp140.dll", "msvcp140.dll"),
+];
+
+pub const DOWNLOAD_SIZE_MB: u32 = 500;
 
 pub enum Msg {
     Progress(f32, String),
@@ -28,18 +46,26 @@ pub struct AiCoach {
     pub rx: Receiver<Msg>,
 }
 
-pub fn model_path() -> PathBuf {
-    crate::storage::local_dir().join("models").join(MODEL_FILE)
+fn coach_dir() -> PathBuf {
+    crate::storage::local_dir().join("coach")
+}
+
+fn model_path() -> PathBuf {
+    coach_dir().join(MODEL_FILE)
+}
+
+fn helper_path() -> PathBuf {
+    coach_dir().join(HELPER_EXE)
 }
 
 pub fn installed() -> bool {
-    model_path().exists()
+    helper_path().exists() && model_path().exists()
 }
 
 pub fn remove() -> std::io::Result<()> {
-    let p = model_path();
-    if p.exists() {
-        std::fs::remove_file(p)?;
+    let d = coach_dir();
+    if d.exists() {
+        std::fs::remove_dir_all(d)?;
     }
     Ok(())
 }
@@ -69,56 +95,46 @@ fn worker(cmds: Receiver<Cmd>, out: Sender<Msg>, ctx: eframe::egui::Context) {
         let _ = out.send(m);
         ctx.request_repaint();
     };
-    #[cfg(feature = "ai")]
-    let mut engine: Option<engine::Engine> = None;
-
     while let Ok(cmd) = cmds.recv() {
         match cmd {
-            Cmd::Download => match download(&send) {
+            Cmd::Download => match download_all(&send) {
                 Ok(()) => send(Msg::Installed),
                 Err(e) => send(Msg::Error(format!("Download failed: {e}"))),
             },
-            Cmd::Generate { system, user } => {
-                #[cfg(feature = "ai")]
-                {
-                    if engine.is_none() {
-                        send(Msg::Progress(0.0, "Loading model…".into()));
-                        match engine::Engine::load(&model_path()) {
-                            Ok(e) => engine = Some(e),
-                            Err(e) => {
-                                send(Msg::Error(format!("Couldn't load the model: {e}")));
-                                continue;
-                            }
-                        }
-                    }
-                    let result = engine.as_ref().unwrap().generate(&system, &user, |t| send(Msg::Token(t)));
-                    match result {
-                        Ok(()) => send(Msg::Done),
-                        Err(e) => send(Msg::Error(format!("The AI coach couldn't run: {e}"))),
-                    }
-                }
-                #[cfg(not(feature = "ai"))]
-                {
-                    let _ = (system, user);
-                    send(Msg::Error("This build was made without the AI coach.".into()));
-                }
-            }
+            Cmd::Generate { system, user } => match run_helper(&system, &user, &send) {
+                Ok(()) => send(Msg::Done),
+                Err(e) => send(Msg::Error(format!("The AI coach couldn't run: {e}"))),
+            },
         }
     }
 }
 
-fn download(send: &impl Fn(Msg)) -> Result<(), String> {
-    use std::io::{Read, Write};
-    let path = model_path();
-    std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
+fn download_all(send: &impl Fn(Msg)) -> Result<(), String> {
+    std::fs::create_dir_all(coach_dir()).map_err(|e| e.to_string())?;
+    let n = HELPER_FILES.len() + 1;
+    for (i, (asset, local)) in HELPER_FILES.iter().enumerate() {
+        let label = format!("coach helper ({}/{n})", i + 1);
+        download(&format!("{RELEASE_BASE}{asset}"), &coach_dir().join(local), &label, send)?;
+    }
+    download(MODEL_URL, &model_path(), &format!("language model ({n}/{n})"), send)
+}
+
+fn download(url: &str, path: &std::path::Path, label: &str, send: &impl Fn(Msg)) -> Result<(), String> {
+    if path.exists() {
+        return Ok(());
+    }
     let part = path.with_extension("part");
-    let resp = ureq::get(MODEL_URL).call().map_err(|e| e.to_string())?;
+    let resp = ureq::get(url).call().map_err(|e| match e {
+        ureq::Error::Status(404, _) => format!(
+            "the {label} isn't available yet. The OnicVoco release on GitHub needs to be published first."
+        ),
+        other => other.to_string(),
+    })?;
     let total: u64 = resp.header("Content-Length").and_then(|v| v.parse().ok()).unwrap_or(0);
     let mut reader = resp.into_reader();
     let mut file = std::fs::File::create(&part).map_err(|e| e.to_string())?;
     let mut buf = vec![0u8; 1 << 16];
-    let mut done: u64 = 0;
-    let mut last_report = 0u64;
+    let (mut done, mut last) = (0u64, 0u64);
     loop {
         let n = reader.read(&mut buf).map_err(|e| e.to_string())?;
         if n == 0 {
@@ -126,10 +142,10 @@ fn download(send: &impl Fn(Msg)) -> Result<(), String> {
         }
         file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
         done += n as u64;
-        if done - last_report > 2_000_000 {
-            last_report = done;
+        if done - last > 1_000_000 {
+            last = done;
             let frac = if total > 0 { done as f32 / total as f32 } else { 0.0 };
-            send(Msg::Progress(frac, format!("{} / {} MB", done / 1_000_000, total / 1_000_000)));
+            send(Msg::Progress(frac, format!("{label}: {} / {} MB", done / 1_000_000, total / 1_000_000)));
         }
     }
     file.flush().map_err(|e| e.to_string())?;
@@ -138,96 +154,50 @@ fn download(send: &impl Fn(Msg)) -> Result<(), String> {
         let _ = std::fs::remove_file(&part);
         return Err("the download was interrupted".into());
     }
-    std::fs::rename(&part, &path).map_err(|e| e.to_string())
+    std::fs::rename(&part, path).map_err(|e| e.to_string())
 }
 
-#[cfg(feature = "ai")]
-mod engine {
-    use anyhow::{anyhow, Result};
-    use llama_cpp_2::context::params::LlamaContextParams;
-    use llama_cpp_2::llama_backend::LlamaBackend;
-    use llama_cpp_2::llama_batch::LlamaBatch;
-    use llama_cpp_2::model::params::LlamaModelParams;
-    use llama_cpp_2::model::{LlamaChatMessage, LlamaModel};
-    use llama_cpp_2::sampling::LlamaSampler;
-    use std::num::NonZeroU32;
-    use std::path::Path;
-
-    pub struct Engine {
-        backend: LlamaBackend,
-        model: LlamaModel,
+fn run_helper(system: &str, user: &str, send: &impl Fn(Msg)) -> Result<(), String> {
+    if !installed() {
+        return Err("it isn't installed. Download it in Settings.".into());
     }
+    send(Msg::Progress(0.0, "Thinking…".into()));
+    let mut cmd = Command::new(helper_path());
+    cmd.arg("--model")
+        .arg(model_path())
+        .current_dir(coach_dir())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = cmd.spawn().map_err(|e| format!("couldn't start the helper ({e})"))?;
 
-    impl Engine {
-        pub fn load(path: &Path) -> Result<Self> {
-            let backend = LlamaBackend::init()?;
-            let model = LlamaModel::load_from_file(&backend, path, &LlamaModelParams::default())?;
-            Ok(Engine { backend, model })
+    let request = serde_json::json!({ "system": system, "user": user }).to_string();
+    {
+        let mut stdin = child.stdin.take().ok_or("no stdin")?;
+        stdin.write_all(request.as_bytes()).map_err(|e| e.to_string())?;
+    } // closing stdin tells the helper the request is complete
+
+    let stdout = child.stdout.take().ok_or("no stdout")?;
+    let mut error = None;
+    for line in BufReader::new(stdout).lines() {
+        let Ok(line) = line else { break };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+        if let Some(t) = v["token"].as_str() {
+            send(Msg::Token(t.replace('—', " - ")));
+        } else if let Some(e) = v["error"].as_str() {
+            error = Some(e.to_string());
         }
-
-        fn prompt(&self, system: &str, user: &str) -> String {
-            let templated = (|| -> Result<String> {
-                let tmpl = self.model.chat_template(None)?;
-                let msgs = vec![
-                    LlamaChatMessage::new("system".into(), system.into())?,
-                    LlamaChatMessage::new("user".into(), user.into())?,
-                ];
-                Ok(self.model.apply_chat_template(&tmpl, &msgs, true)?)
-            })();
-            templated.unwrap_or_else(|_| {
-                format!("<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n")
-            })
-        }
-
-        pub fn generate(&self, system: &str, user: &str, mut on_token: impl FnMut(String)) -> Result<()> {
-            let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8) as i32;
-            let params = LlamaContextParams::default()
-                .with_n_ctx(NonZeroU32::new(2048))
-                .with_n_threads(threads)
-                .with_n_threads_batch(threads);
-            let mut ctx = self.model.new_context(&self.backend, params)?;
-
-            let vocab = self.model.vocab();
-            // Qwen uses no BOS token; parse the chat template's special tokens.
-            let tokens = vocab.tokenize(self.prompt(system, user).as_bytes(), false, true);
-            if tokens.is_empty() || tokens.len() > 1500 {
-                return Err(anyhow!("prompt has an unexpected length"));
-            }
-            let mut batch = LlamaBatch::new(2048, 1);
-            let last = tokens.len() as i32 - 1;
-            for (i, tok) in (0_i32..).zip(tokens.into_iter()) {
-                batch.add(tok, i, &[0], i == last)?;
-            }
-            ctx.decode(&mut batch)?;
-
-            let mut sampler = LlamaSampler::chain_simple([
-                LlamaSampler::temp(0.5),
-                LlamaSampler::top_p(0.9, 1),
-                LlamaSampler::dist(1234),
-            ]);
-            let mut decoder = encoding_rs::UTF_8.new_decoder();
-            let mut n_cur = batch.n_tokens();
-            let max = n_cur + 220;
-            while n_cur < max {
-                let token = sampler.sample(&ctx, batch.n_tokens() - 1);
-                sampler.accept(token);
-                if vocab.is_eog(token) {
-                    break;
-                }
-                // Tokens can split multi-byte characters, so decode as a stream.
-                let bytes = vocab.token_to_piece(token, false, None);
-                let cap = decoder.max_utf8_buffer_length(bytes.len()).unwrap_or(bytes.len() * 3 + 8);
-                let mut piece = String::with_capacity(cap);
-                let _ = decoder.decode_to_string(&bytes, &mut piece, false);
-                if !piece.is_empty() {
-                    on_token(piece.replace('—', " - "));
-                }
-                batch.clear();
-                batch.add(token, n_cur, &[0], true)?;
-                n_cur += 1;
-                ctx.decode(&mut batch)?;
-            }
-            Ok(())
-        }
+    }
+    let status = child.wait().map_err(|e| e.to_string())?;
+    match error {
+        Some(e) => Err(e),
+        None if !status.success() => Err(format!("the helper stopped unexpectedly ({status})")),
+        None => Ok(()),
     }
 }

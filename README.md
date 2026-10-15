@@ -20,10 +20,11 @@ Press **Space** to start or finish a session.
 
 ## The AI coach
 
-Off by default, and nothing AI related is inside the installer. If someone wants it, they turn it on in **Settings**:
+Off by default, and nothing AI related is inside OnicVoco.exe or the installer. It's a separate download, fetched only when someone presses **Download AI coach** in **Settings**:
 
-- Downloads Qwen2.5 0.5B Instruct (Q4_K_M GGUF, about 490 MB) from Hugging Face once
-- Runs natively on the CPU with llama.cpp after that, fully offline
+- A small helper program, `onicvoco-coach.exe` (built from `coach/`, attached to each GitHub release)
+- Qwen2.5 0.5B Instruct (Q4_K_M GGUF, about 490 MB) from Hugging Face
+- After that it runs natively on the CPU with llama.cpp, fully offline. The app starts the helper in the background only when you ask for feedback
 - It never hears audio. It only reads the numbers from the session summary. All measuring is done by the app itself.
 - **Remove model** deletes it
 
@@ -49,12 +50,13 @@ The app isn't code-signed yet, so Windows SmartScreen may warn you. Click **More
 
 ## Building
 
-Install [Rust](https://rustup.rs) and Visual Studio Build Tools (C++ workload) plus CMake and LLVM (needed for the AI coach).
+Install [Rust](https://rustup.rs) and Visual Studio Build Tools (C++ workload). The AI helper also needs CMake and LLVM.
 
 ```powershell
-cargo run --release                          # run the app
-cargo test --no-default-features             # analysis unit tests
-cargo build --release --no-default-features  # build without the AI coach
+cargo run --release -p onicvoco             # run the app
+cargo test -p onicvoco                       # analysis unit tests
+# the optional AI helper (llama.cpp needs the dynamic C runtime):
+$env:RUSTFLAGS="-C target-feature=-crt-static"; cargo build --release -p onicvoco-coach --target-dir target-coach
 ```
 
 ## Releasing
@@ -74,6 +76,7 @@ src/
   dsp/           pitch, formants, register, cracks, FFT, notes (unit tested)
   session.rs     stats, tips, passaggio finder, AI prompt
   content.rs     reading passages and training guides
-  ai.rs          optional AI coach (download + llama.cpp)
+  ai.rs          optional AI coach: downloads and runs the helper
+coach/           the separate AI helper program (llama.cpp)
 installer/       Inno Setup script
 ```

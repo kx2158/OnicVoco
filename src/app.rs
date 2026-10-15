@@ -894,8 +894,8 @@ impl App {
                 chip(ui, &p, "optional", false);
             });
             ui.label(format!(
-                "Off by default. If you want it, OnicVoco downloads a small language model (Qwen2.5 0.5B, about {} MB) from Hugging Face once. After that it runs entirely on this computer's CPU. It never hears your voice: it only reads the numbers from your session summary, and nothing is sent anywhere.",
-                ai::MODEL_SIZE_MB
+                "Off by default and not part of the app itself. If you want it, OnicVoco downloads it separately (a small helper program plus the Qwen2.5 0.5B language model, about {} MB in total) once. After that it runs entirely on this computer's CPU. It never hears your voice: it only reads the numbers from your session summary, and nothing is sent anywhere.",
+                ai::DOWNLOAD_SIZE_MB
             ));
             let downloading = match &self.ai_state {
                 AiState::Downloading(f, s) => Some((*f, s.clone())),
