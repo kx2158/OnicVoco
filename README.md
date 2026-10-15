@@ -1,111 +1,79 @@
 # OnicVoco
 
-Gentle, private voice training for Windows, macOS and Linux.
+Gentle, private voice training. A fully native Windows app written in Rust: no browser, no webview, one small `.exe`.
 
-- **Live pitch meter** with the frequency in Hz and the note in scientific pitch notation (G3 +4¢)
-- **Goal ranges**: feminine, androgynous, masculine or your own custom range
-- **Resonance meter** (darker to brighter), estimated from your formants
-- **Pitch-over-time graph** and a note strip that highlights your goal range
-- **Microphone picker** and input level meter
-- **Session summary** with tips, playback and an option to save your recording
-- **Progress history** stored only on your device
+## Features
+
+- **Live pitch** in Hz and scientific pitch notation (G3 +4¢), with a status for your goal range
+- **Goals**: feminine, androgynous, masculine or a custom range
+- **Register meter**: chest, mix / passaggio, head / falsetto (estimated from H1-H2)
+- **Find my passaggio**: glide low to high and the app finds where your voice changes gear, then marks it on the graph and note strip
+- **Voice crack detection**: cracks are marked on the pitch graph, counted in your summary, with tips right when they happen
+- **Resonance meter** (darker to brighter), estimated from formants
+- **Read tab**: practice passages and quick phrases with a live meter on top
+- **Learn tab**: chest voice, head voice and falsetto, passaggio, mix, resonance, voice cracks, safe practice, with exercises
+- **Session summary**, recording playback/saving (WAV) and **progress history**, all stored only on your computer
 - **Optional AI coach** that turns your session numbers into friendly feedback
+- Monochrome light and dark themes (follows Windows by default)
 
-Everything runs locally. Your voice is never uploaded anywhere.
+Press **Space** to start or finish a session.
 
-## About the AI coach
+## The AI coach
 
-The AI coach is **off by default** and nothing AI related is included in the installer.
-If someone wants it, they can download it from Settings:
+Off by default, and nothing AI related is inside the installer. If someone wants it, they turn it on in **Settings**:
 
-- Model: Qwen2.5 0.5B Instruct (8-bit), about 520 MB, from Hugging Face
-- Runs entirely on the computer's CPU after the one-time download
-- It never hears audio. It only reads the numbers from the session summary (median pitch, % in range, resonance, and so on). The app does all the measuring itself.
-- "Remove model" in Settings deletes it completely
-
-The basic, rule-based tips work without the AI coach.
+- Downloads Qwen2.5 0.5B Instruct (Q4_K_M GGUF, about 490 MB) from Hugging Face once
+- Runs natively on the CPU with llama.cpp after that, fully offline
+- It never hears audio. It only reads the numbers from the session summary. All measuring is done by the app itself.
+- **Remove model** deletes it
 
 ## How the measurements work
 
 | What | How |
 |---|---|
-| Pitch | YIN algorithm on 2048-sample frames (~30 times per second), median-smoothed to avoid octave jumps |
-| Notes | A4 = 440 Hz, middle C = C4, cents = distance from the nearest note |
-| Resonance | LPC analysis finds the first two formants (F1, F2), which are mapped to a 0 (darker) to 1 (brighter) score |
+| Pitch | YIN on 2048-sample frames, ~30 per second, median-smoothed |
+| Notes | A4 = 440 Hz, middle C = C4 |
+| Register | H1-H2: level difference between the 1st and 2nd harmonic. Low = chest, high = head/falsetto |
+| Cracks | A jump of 4+ semitones between consecutive frames, with stable pitch on both sides |
+| Resonance | LPC formant analysis (F1, F2) mapped to a darker-to-brighter score |
 
-Resonance depends heavily on which vowel you are saying, so treat it as a trend over a few sentences, not a verdict on a single word.
+Register and resonance are estimates. They shift with vowels and microphones, so watch the trend.
 
-Pitch ranges are common rough guides from voice training communities:
+## Download
 
-| Goal | Range | Notes |
-|---|---|---|
-| Masculine | 85-155 Hz | F2 to D#3 |
-| Androgynous | 145-175 Hz | D3 to F3 |
-| Feminine | 165-255 Hz | E3 to C4 |
+Go to **Releases** and grab either:
+- `OnicVoco-x.y.z-setup.exe` - installer, no admin rights needed
+- `OnicVoco-x.y.z-portable.exe` - just run it
 
-Every voice is different, so the custom range is there for a reason.
+The app isn't code-signed yet, so Windows SmartScreen may warn you. Click **More info > Run anyway**.
 
-## Development
+## Building
 
-You need [Node.js](https://nodejs.org) 20+ and [Rust](https://rustup.rs). On Linux, also install the [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/).
+Install [Rust](https://rustup.rs) and Visual Studio Build Tools (C++ workload) plus CMake and LLVM (needed for the AI coach).
 
-```bash
-npm install
-npm test               # analysis unit tests
-npm run dev            # UI only, in your browser at http://localhost:1420
-npm run tauri dev      # the real desktop app
-npm run tauri build    # installers for your current OS
+```powershell
+cargo run --release                          # run the app
+cargo test --no-default-features             # analysis unit tests
+cargo build --release --no-default-features  # build without the AI coach
 ```
 
-## Releases on GitHub
+## Releasing
 
-`.github/workflows/release.yml` builds every platform on GitHub's servers:
-
-1. Bump the version in `package.json` and `src-tauri/tauri.conf.json`
-2. Commit, then tag and push:
-   ```bash
-   git tag v0.1.0
-   git push origin v0.1.0
-   ```
-3. When the workflow finishes, open **Releases**, check the draft and publish it
-
-You can also start it manually from the **Actions** tab (Release > Run workflow).
-
-Builds produced:
-
-| Platform | Files |
-|---|---|
-| Windows | `.msi`, `-setup.exe` |
-| macOS Apple Silicon | `aarch64.dmg` |
-| macOS Intel | `x64.dmg` |
-| Linux | `.AppImage`, `.deb`, `.rpm` |
-
-### macOS note
-
-The macOS builds are ad-hoc signed but not notarized (that needs a paid Apple Developer account). The first time, users should right-click the app and choose **Open**. If macOS says the app "is damaged", run this once in Terminal:
-
-```bash
-xattr -cr /Applications/OnicVoco.app
-```
-
-### Microphone permissions
-
-- **macOS**: asks the first time. If it was denied: System Settings > Privacy & Security > Microphone
-- **Windows**: Settings > Privacy & security > Microphone > allow desktop apps
-- **Linux**: needs GStreamer's PulseAudio/PipeWire plugin, bundled in the AppImage and listed as a dependency of the `.deb`
+Actions tab > **Release** > **Run workflow**, enter a version like `0.2.0`. It builds the installer and portable exe and creates a draft release to review and publish.
 
 ## Project layout
 
 ```
 src/
-  audio/pitch.js      YIN pitch detection
-  audio/formants.js   LPC formants + resonance score
-  audio/engine.js     microphone capture and analysis loop
-  notes.js            scientific pitch notation
-  targets.js          goal ranges
-  coach.js            session stats, tips and the AI prompt
-  ai/                 optional AI coach (web worker + model storage)
-  ui/                 pitch graph and note strip
-src-tauri/            desktop shell (Rust, Tauri 2)
-tests/                unit tests with synthetic voices
+  main.rs        window setup
+  app.rs         the UI: Practice, Read, Learn, Progress, Settings
+  widgets.rs     pitch graph, note strip, meters
+  theme.rs       monochrome themes + Segoe UI
+  audio.rs       microphone capture (WASAPI via cpal), WAV saving
+  analyzer.rs    turns audio into analysis frames
+  dsp/           pitch, formants, register, cracks, FFT, notes (unit tested)
+  session.rs     stats, tips, passaggio finder, AI prompt
+  content.rs     reading passages and training guides
+  ai.rs          optional AI coach (download + llama.cpp)
+installer/       Inno Setup script
 ```

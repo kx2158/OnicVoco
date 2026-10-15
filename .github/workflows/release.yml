@@ -1,76 +1,60 @@
-# Builds OnicVoco for Windows, macOS (Apple Silicon + Intel) and Linux and
-# attaches the installers to a draft GitHub Release.
-# Trigger: push a tag like v0.1.0, or run it manually from the Actions tab.
+# Builds the Windows installer + portable .exe and attaches them to a draft
+# GitHub Release. Run it from the Actions tab: Release > Run workflow.
 
 name: Release
 
 on:
-  push:
-    tags: ['v*']
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version number (without the v), e.g. 0.2.0'
+        required: true
+        default: '0.2.0'
 
 permissions:
   contents: write
 
 jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: macos-latest
-            args: --target aarch64-apple-darwin
-          - platform: macos-latest
-            args: --target x86_64-apple-darwin
-          - platform: ubuntu-22.04
-            args: ''
-          - platform: windows-latest
-            args: ''
-
-    runs-on: ${{ matrix.platform }}
-
+  windows:
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Linux build dependencies
-        if: matrix.platform == 'ubuntu-22.04'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf \
-            gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-pulseaudio
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-
       - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Package portable exe
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/onicvoco.exe "dist/OnicVoco-${{ inputs.version }}-portable.exe"
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+          }
+          & $iscc "/DAppVersion=${{ inputs.version }}" installer/onicvoco.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - uses: softprops/action-gh-release@v2
         with:
-          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+          tag_name: v${{ inputs.version }}
+          target_commitish: ${{ github.sha }}
+          name: OnicVoco v${{ inputs.version }}
+          draft: true
+          body: |
+            **Windows**
+            - `OnicVoco-${{ inputs.version }}-setup.exe` - installer (no admin needed, adds a Start menu shortcut)
+            - `OnicVoco-${{ inputs.version }}-portable.exe` - single file, just run it
 
-      - uses: swatinem/rust-cache@v2
-        with:
-          workspaces: './src-tauri -> target'
-
-      - name: Install frontend dependencies
-        run: npm install
-
-      - name: Run analysis tests
-        run: npm test
-
-      - uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tagName: v__VERSION__
-          releaseName: OnicVoco v__VERSION__
-          releaseBody: |
-            **Downloads**
-            - Windows: `.msi` or `-setup.exe`
-            - macOS Apple Silicon (M1 and newer): `aarch64.dmg`
-            - macOS Intel: `x64.dmg`
-            - Linux: `.AppImage` (any distro), `.deb` (Ubuntu/Debian) or `.rpm` (Fedora)
-
-            macOS builds are not notarized yet. If macOS says the app is damaged or from an unidentified developer, see the README.
-          releaseDraft: true
-          prerelease: false
-          args: ${{ matrix.args }}
+            Windows may show "Windows protected your PC" because the app isn't code-signed yet. Click **More info > Run anyway**.
+          files: |
+            dist/OnicVoco-${{ inputs.version }}-setup.exe
+            dist/OnicVoco-${{ inputs.version }}-portable.exe

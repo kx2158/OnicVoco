@@ -1,7 +1,4 @@
-node_modules/
+target/
 dist/
-public/ort/
-src-tauri/target/
-src-tauri/gen/
+*.part
 .DS_Store
-*.log
