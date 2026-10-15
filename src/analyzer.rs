@@ -3,6 +3,7 @@
 use crate::dsp::cracks::{Crack, CrackDetector};
 use crate::dsp::formants::{self, Formants};
 use crate::dsp::register::{self, Register, RegisterTracker};
+use crate::dsp::undertone::{self, Undertone};
 use crate::dsp::{pitch, rms_db};
 
 pub const FRAME: usize = 4096;
@@ -21,6 +22,7 @@ pub struct LiveFrame {
     pub h1h2: Option<f32>,
     pub register: Option<Register>,
     pub crack: Option<Crack>,
+    pub under: Option<Undertone>,
 }
 
 pub struct Analyzer {
@@ -29,6 +31,7 @@ pub struct Analyzer {
     res_ema: Option<f32>,
     reg: RegisterTracker,
     cracks: CrackDetector,
+    under_ema: Option<(f32, f32, Option<f32>)>,
 }
 
 impl Analyzer {
@@ -39,6 +42,7 @@ impl Analyzer {
             res_ema: None,
             reg: RegisterTracker::default(),
             cracks: CrackDetector::default(),
+            under_ema: None,
         };
         a.reset();
         a
@@ -49,6 +53,7 @@ impl Analyzer {
         self.res_ema = None;
         self.reg.reset();
         self.cracks.reset();
+        self.under_ema = None;
     }
 
     /// `buf` must hold the newest FRAME samples.
@@ -77,13 +82,44 @@ impl Analyzer {
                     f.register = Some(self.reg.push(h));
                     f.h1h2 = self.reg.smoothed();
                 }
+                f.under = Some(self.smooth_under(undertone::analyze(buf, sr, p.hz, p.clarity)));
+            } else if p.is_none() {
+                // No normal pitch: is it creak below the usual range?
+                if let Some(hz) = undertone::creak_hz(buf, sr) {
+                    f.under = Some(self.smooth_under(undertone::creaky(hz)));
+                }
             }
+        }
+        if f.under.is_none() {
+            self.under_ema = None;
         }
         if raw.is_none() {
             self.recent.clear();
         }
         f.crack = self.cracks.push(t, raw);
         f
+    }
+
+    /// Smooths the three undertone scores so the meters don't flicker.
+    fn smooth_under(&mut self, mut u: Undertone) -> Undertone {
+        let a = 0.4;
+        let (airy, fry, rough) = match self.under_ema {
+            Some((pa, pf, pr)) => (
+                pa + (u.airy - pa) * a,
+                pf + (u.fry - pf) * a,
+                match (pr, u.rough) {
+                    (Some(p), Some(r)) => Some(p + (r - p) * a),
+                    (None, r) => r,
+                    (p, None) => p,
+                },
+            ),
+            None => (u.airy, u.fry, u.rough),
+        };
+        self.under_ema = Some((airy, fry, rough));
+        u.airy = airy;
+        u.fry = fry;
+        u.rough = rough;
+        u
     }
 
     // Median of the last few readings removes single-frame octave jumps.

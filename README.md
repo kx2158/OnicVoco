@@ -11,6 +11,9 @@ Gentle, private voice training. A fully native Windows app written in Rust: no b
 - **Find my passaggio**: glide low to high and the app finds where your voice changes gear, then marks it on the graph and note strip
 - **Voice crack detection**: sudden jumps between falsetto and chest (either direction) are marked on the pitch graph with a little pop, counted in your summary, with tips right when they happen
 - **Resonance meter** (darker to brighter), estimated from formants
+- **Undertones monitor**: a live mini-spectrum around your pitch plus meters for airiness, vocal fry and roughness (sub-harmonics at half your pitch)
+- **Range tab**: a vocal range map that fills in while the mic is live (time on every note from C2 to C6, stacked by chest / mix / head, with crack spots, comfort zone and goal coverage), plus a guided **Map my range** glide
+- **Voice web** (Progress tab): a radar chart that grows as you use the app and shows your strengths and the area with the most room to grow: pitch, steadiness, resonance, smooth breaks, clean tone, range and practice habit
 - **Read tab**: practice passages and quick phrases with a live meter on top
 - **Learn tab**: chest voice, head voice and falsetto, passaggio, mix, resonance, voice cracks, safe practice, with exercises
 - **Pitch graph** with very light semitone lines, a "Last 12 s" or "Whole session" view
@@ -40,6 +43,11 @@ Off by default, and nothing AI related is inside OnicVoco.exe or the installer. 
 | Register | H1-H2: level difference between the 1st and 2nd harmonic. Low = chest, high = head/falsetto |
 | Cracks | The median pitch a few frames before vs. after a break differs by 4.5+ semitones (up or down), allowing a transitional frame or a tiny dropout at the break; breathy falsetto frames are still tracked |
 | Resonance | LPC formant analysis (F1, F2) mapped to a darker-to-brighter score |
+| Airy | How periodic the waveform is: breathier frames are less periodic |
+| Fry | Pitch below about 80 Hz, or a slow pulse train under the normal range when no regular pitch is found |
+| Rough | Level at half the pitch relative to the pitch (sub-harmonics). Needs a pitch of 130 Hz or more, because mains hum sits near 50 Hz |
+| Range map | Every analysis frame adds its duration to the nearest semitone; a note counts as in your range after 0.4 s in total |
+| Voice web | Each axis is a running average of something the app already measures, with a gentle memory (recent practice counts a bit more). A crack counts against *Smooth breaks* as ten seconds of rough going. Range and habit come from the range map and practice days |
 
 Register and resonance are estimates. They shift with vowels and microphones, so watch the trend.
 
@@ -71,13 +79,14 @@ Actions tab > **Release** > **Run workflow**, enter a version like `0.2.0`. It b
 ```
 src/
   main.rs        window setup
-  app.rs         the UI: Practice, Read, Learn, Progress, Settings
-  widgets.rs     pitch graph, note strip, meters
+  app.rs         the UI: Practice, Read, Learn, Range, Progress, Settings
+  widgets.rs     pitch graph, note strip, meters, range map, voice web
   theme.rs       monochrome themes + Segoe UI
   audio.rs       microphone capture (WASAPI via cpal), WAV saving
   analyzer.rs    turns audio into analysis frames
-  dsp/           pitch, formants, register, cracks, FFT, notes (unit tested)
+  dsp/           pitch, formants, register, cracks, undertones, FFT, notes (unit tested)
   session.rs     stats, tips, passaggio finder, AI prompt
+  profile.rs     range map and voice web (kept on this computer)
   content.rs     reading passages and training guides
   ai.rs          optional AI coach: downloads and runs the helper
 coach/           the separate AI helper program (llama.cpp)

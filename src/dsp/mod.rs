@@ -7,6 +7,7 @@ pub mod formants;
 pub mod notes;
 pub mod pitch;
 pub mod register;
+pub mod undertone;
 
 /// Root mean square level in dBFS, floored at -100.
 pub fn rms_db(buf: &[f32]) -> f32 {

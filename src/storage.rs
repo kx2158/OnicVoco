@@ -98,3 +98,13 @@ pub fn load_history() -> Vec<HistoryEntry> {
 pub fn save_history(h: &[HistoryEntry]) {
     write("history.json", &h);
 }
+
+pub fn load_profile() -> crate::profile::Profile {
+    let mut p: crate::profile::Profile = read("profile.json").unwrap_or_default();
+    p.prepare();
+    p
+}
+
+pub fn save_profile(p: &crate::profile::Profile) {
+    write("profile.json", p);
+}

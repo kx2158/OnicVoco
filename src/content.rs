@@ -139,6 +139,21 @@ pub const GUIDES: &[Guide] = &[
         ],
     },
     Guide {
+        title: "Undertones: fry, air and roughness",
+        summary: "What the Undertones card on the Practice tab is telling you.",
+        body: &[
+            "Vocal fry (creak) is a low, rattly sound where the folds flap slowly. It is fine as a texture, but sliding into it at the ends of sentences is common and makes a voice sound lower and tired.",
+            "Airiness means extra breath leaks through the folds. A little is warm and soft, a lot makes the voice tire quickly and carry less. It is the usual price of pure falsetto.",
+            "Roughness shows up as extra energy at half your pitch (sub-harmonics). It often means strain, or a voice about to flip registers, so it tends to appear just before a crack.",
+            "These are estimates from a microphone. Rooms, mics and vowels shift them, so watch how they change as you practise rather than chasing a number.",
+        ],
+        exercises: &[
+            ("Cut the fry", "Say \"mm-hmm\" and let your last word land on a light, steady pitch instead of dropping into a rattle. Keep the sentence ending as high as it started."),
+            ("Steady air", "Hum a soft \"mm\" for ten seconds and watch the Airy bar. Aim for an even, small amount rather than none."),
+            ("Ease off roughness", "When Rough rises, get quieter and thinner instead of pushing. Roughness usually fades as the volume and effort come down."),
+        ],
+    },
+    Guide {
         title: "Practice safely",
         summary: "Small, regular sessions beat long, hard ones.",
         body: &[

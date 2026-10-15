@@ -7,6 +7,7 @@ mod app;
 mod audio;
 mod content;
 mod dsp;
+mod profile;
 mod session;
 mod storage;
 mod theme;

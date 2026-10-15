@@ -3,6 +3,8 @@
 use crate::dsp::cracks::Crack;
 use crate::dsp::notes::{hz_to_midi, is_sharp, midi_name, midi_to_hz};
 use crate::dsp::register::Register;
+use crate::dsp::undertone::{Undertone, SPEC_N};
+use crate::profile::{AxisView, NoteStat, NOTE_MAX, NOTE_MIN};
 use crate::session::Target;
 use crate::theme::{bold, Pal};
 use eframe::egui::{self, pos2, vec2, Align2, Color32, FontId, Pos2, Rect, RichText, Rounding, Sense, Shape, Stroke, Ui};
@@ -537,5 +539,303 @@ pub fn bar(ui: &mut Ui, p: &Pal, frac: f32, height: f32) {
     fill.set_width(rect.width() * shown);
     if fill.width() > 0.5 {
         ui.painter().rect_filled(fill, r, p.text);
+    }
+}
+
+// ---------- undertones ----------
+
+fn mini_meter(ui: &mut Ui, p: &Pal, id: egui::Id, label: &str, value: Option<f32>, live: bool) {
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::hover());
+    let painter = ui.painter_at(rect.expand(2.0));
+    let on = ui.ctx().animate_bool_with_time(id.with("on"), live && value.is_some(), 0.25);
+    let v = ui.ctx().animate_value_with_time(id, value.unwrap_or(0.0), 0.15);
+    painter.text(pos2(rect.left(), rect.center().y), Align2::LEFT_CENTER, label, FontId::new(13.0, bold()), p.text);
+    let bar = Rect::from_x_y_ranges(rect.left() + 64.0..=rect.right() - 44.0, rect.center().y - 4.0..=rect.center().y + 4.0);
+    painter.rect_filled(bar, Rounding::same(4.0), p.card2);
+    let w = bar.width() * v.clamp(0.0, 1.0);
+    if w > 1.0 {
+        let mut r = bar;
+        r.set_right(bar.left() + w);
+        painter.rect_filled(r, Rounding::same(4.0), fade(p.text, 0.25 + 0.75 * on));
+    }
+    let txt = match value {
+        Some(v) if live => format!("{}%", (v * 100.0).round()),
+        _ => "--".to_string(),
+    };
+    painter.text(pos2(rect.right(), rect.center().y), Align2::RIGHT_CENTER, txt, FontId::proportional(12.0), p.muted);
+}
+
+/// Live undertone monitor: a small spectrum around the pitch (the half-pitch
+/// zone is highlighted) and three meters for air, fry and roughness.
+pub fn undertone_monitor(ui: &mut Ui, p: &Pal, u: Option<&Undertone>, active: bool) {
+    let h = 62.0;
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), h + 18.0), Sense::hover());
+    let painter = ui.painter_at(rect.expand(2.0));
+    let area = Rect::from_min_size(rect.min, vec2(rect.width(), h));
+    painter.rect_filled(area, Rounding::same(10.0), p.card2);
+    let id = ui.id().with("under");
+    let on = ui.ctx().animate_bool_with_time(id.with("on"), u.is_some() && active, 0.3);
+
+    let inner = area.shrink2(vec2(8.0, 6.0));
+    let gap = 2.0;
+    let bw = (inner.width() - gap * (SPEC_N as f32 - 1.0)) / SPEC_N as f32;
+    // position of a multiple of the pitch across the window (0.25x .. 3.25x)
+    let frac = |k: f32| (k - 0.25) / 3.0;
+    for i in 0..SPEC_N {
+        let raw = u.map(|u| u.spectrum[i]).unwrap_or(0.0);
+        let v = ui.ctx().animate_value_with_time(id.with(i), raw, 0.09) * on;
+        let k = 0.25 + 3.0 * (i as f32 + 0.5) / SPEC_N as f32;
+        let sub_zone = (0.4..0.62).contains(&k);
+        let x = inner.left() + i as f32 * (bw + gap);
+        let hgt = (inner.height() * v).max(2.0);
+        let r = Rect::from_min_size(pos2(x, inner.bottom() - hgt), vec2(bw, hgt));
+        let c = if sub_zone { p.text } else { fade(p.text, 0.32) };
+        painter.rect_filled(r, Rounding::same(2.0), fade(c, 0.35 + 0.65 * on));
+    }
+    let f = FontId::proportional(10.5);
+    for (k, label) in [(0.5, "half"), (1.0, "pitch"), (2.0, "2x"), (3.0, "3x")] {
+        let x = inner.left() + inner.width() * frac(k);
+        painter.text(pos2(x, area.bottom() + 9.0), Align2::CENTER_CENTER, label, f.clone(), if k == 0.5 { p.text } else { p.muted });
+    }
+
+    ui.add_space(2.0);
+    let live = active && u.is_some();
+    mini_meter(ui, p, id.with("airy"), "Airy", u.map(|u| u.airy), live);
+    mini_meter(ui, p, id.with("fry"), "Fry", u.map(|u| u.fry), live);
+    mini_meter(ui, p, id.with("rough"), "Rough", u.and_then(|u| u.rough), live);
+}
+
+// ---------- range map ----------
+
+pub struct RangeOpts<'a> {
+    pub notes: &'a [NoteStat],
+    pub target: &'a Target,
+    pub passaggio: Option<f32>,
+    /// Live pitch as a MIDI number (fractional).
+    pub live_midi: Option<f32>,
+    /// Range reached so far in a guided "map my range" run.
+    pub session: Option<(i32, i32)>,
+    pub range: Option<(i32, i32)>,
+    pub comfort: Option<(i32, i32)>,
+    /// 0..1 grow-in animation.
+    pub grow: f32,
+    pub height: f32,
+}
+
+/// One bar per semitone: time spent there, stacked by register.
+pub fn range_map(ui: &mut Ui, p: &Pal, o: &RangeOpts) {
+    let n = (NOTE_MAX - NOTE_MIN + 1) as usize;
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), o.height), Sense::hover());
+    let painter = ui.painter_at(rect.expand(3.0));
+    let axis_h = 34.0;
+    let top_pad = 26.0;
+    let chart = Rect::from_min_max(pos2(rect.left() + 2.0, rect.top() + top_pad), pos2(rect.right() - 2.0, rect.bottom() - axis_h));
+    let colw = chart.width() / n as f32;
+    let col_x = |m: f32| chart.left() + (m - NOTE_MIN as f32 + 0.5) * colw;
+    let edge_x = |m: f32| chart.left() + (m - NOTE_MIN as f32) * colw;
+
+    // goal band
+    let (g0, g1) = (hz_to_midi(o.target.min_hz), hz_to_midi(o.target.max_hz));
+    let band = Rect::from_x_y_ranges(edge_x(g0 - 0.5).max(chart.left())..=edge_x(g1 + 0.5).min(chart.right()), chart.top() - 6.0..=chart.bottom());
+    painter.rect_filled(band, Rounding::same(8.0), p.card2);
+
+    // very light horizontal guides
+    for f in [0.25, 0.5, 0.75] {
+        let y = chart.bottom() - chart.height() * f;
+        painter.line_segment([pos2(chart.left(), y), pos2(chart.right(), y)], Stroke::new(0.5_f32, fade(p.stroke, 0.45)));
+    }
+
+    // guided run: soft highlight over what's been reached
+    if let Some((a, b)) = o.session {
+        let r = Rect::from_x_y_ranges(edge_x(a as f32)..=edge_x(b as f32 + 1.0), chart.top() - 6.0..=chart.bottom());
+        painter.rect_filled(r, Rounding::same(6.0), fade(p.text, 0.07));
+    }
+
+    let max_secs = o.notes.iter().map(|n| n.secs).fold(1.0f32, f32::max);
+    let shades = [1.0, 0.55, 0.28];
+    for (i, ns) in o.notes.iter().enumerate().take(n) {
+        let x = chart.left() + i as f32 * colw;
+        let bar_w = (colw - 2.0).max(1.0);
+        let col = Rect::from_min_size(pos2(x + 1.0, chart.top()), vec2(bar_w, chart.height()));
+        // per-column stagger so the bars rise like a little wave
+        let delay = i as f32 / n as f32 * 0.5;
+        let g = ((o.grow - delay) / 0.5).clamp(0.0, 1.0);
+        let g = 1.0 - (1.0 - g) * (1.0 - g);
+        let frac = (ns.secs / max_secs).sqrt() * g;
+        let total_h = if ns.secs > 0.0 { (chart.height() * frac).max(if ns.mapped() { 3.0 } else { 1.5 }) } else { 0.0 };
+        if total_h > 0.0 {
+            let known = ns.chest + ns.mix + ns.head;
+            let unknown = (ns.secs - known).max(0.0);
+            let mut y = col.bottom();
+            let parts = [(ns.chest, shades[0]), (ns.mix, shades[1]), (ns.head, shades[2]), (unknown, 0.12)];
+            let sum: f32 = parts.iter().map(|(v, _)| v).sum::<f32>().max(1e-6);
+            for (v, a) in parts {
+                let hh = total_h * v / sum;
+                if hh > 0.2 {
+                    let r = Rect::from_min_size(pos2(col.left(), y - hh), vec2(bar_w, hh));
+                    painter.rect_filled(r, Rounding::same(1.5), fade(p.text, a * if ns.mapped() { 1.0 } else { 0.5 }));
+                    y -= hh;
+                }
+            }
+        }
+        if ns.cracks > 0.0 {
+            let cy = chart.bottom() - total_h - 7.0;
+            painter.circle_stroke(pos2(col.center().x, cy), 3.5, Stroke::new(1.4_f32, p.text));
+        }
+    }
+
+    // mapped extent
+    if let Some((lo, hi)) = o.range {
+        let y = rect.top() + 12.0;
+        let (xa, xb) = (col_x(lo as f32), col_x(hi as f32));
+        let grown = xa + (xb - xa) * o.grow.clamp(0.0, 1.0);
+        let s = Stroke::new(1.6_f32, p.text);
+        painter.line_segment([pos2(xa, y), pos2(grown, y)], s);
+        painter.line_segment([pos2(xa, y - 4.0), pos2(xa, y + 4.0)], s);
+        if o.grow >= 1.0 {
+            painter.line_segment([pos2(xb, y - 4.0), pos2(xb, y + 4.0)], s);
+        }
+        let f = FontId::new(11.0, bold());
+        painter.text(pos2(xa, y - 7.0), Align2::CENTER_BOTTOM, midi_name(lo), f.clone(), p.text);
+        if o.grow >= 1.0 {
+            painter.text(pos2(xb, y - 7.0), Align2::CENTER_BOTTOM, midi_name(hi), f, p.text);
+        }
+    }
+    // comfort zone, a quiet underline
+    if let Some((a, b)) = o.comfort {
+        let y = chart.bottom() + 4.0;
+        painter.line_segment([pos2(edge_x(a as f32) + 1.0, y), pos2(edge_x(b as f32 + 1.0) - 1.0, y)], Stroke::new(3.0_f32, fade(p.text, 0.5)));
+    }
+    if let Some(ph) = o.passaggio {
+        let x = col_x(hz_to_midi(ph));
+        painter.extend(Shape::dashed_line(&[pos2(x, chart.top() - 4.0), pos2(x, chart.bottom())], Stroke::new(1.2_f32, p.muted), 5.0, 4.0));
+        painter.text(pos2(x + 4.0, chart.top() + 2.0), Align2::LEFT_TOP, "passaggio", FontId::proportional(10.5), p.muted);
+    }
+
+    // piano-key strip with note names on every C
+    let keys_top = chart.bottom() + 9.0;
+    for i in 0..n {
+        let m = NOTE_MIN + i as i32;
+        let x = chart.left() + i as f32 * colw;
+        let kr = Rect::from_min_size(pos2(x + 0.5, keys_top), vec2((colw - 1.0).max(1.0), 8.0));
+        if is_sharp(m) {
+            painter.rect_filled(kr, Rounding::same(1.5), fade(p.text, 0.75));
+        } else {
+            painter.rect_filled(kr, Rounding::same(1.5), p.card2);
+            painter.rect_stroke(kr, Rounding::same(1.5), Stroke::new(0.5_f32, p.stroke));
+        }
+        if m.rem_euclid(12) == 0 {
+            painter.text(pos2(x + colw / 2.0, keys_top + 19.0), Align2::CENTER_CENTER, midi_name(m), FontId::proportional(10.5), p.muted);
+        }
+    }
+
+    // live marker
+    let id = ui.id().with("range-live");
+    let on = ui.ctx().animate_bool_with_time(id.with("on"), o.live_midi.is_some(), 0.25);
+    let lm = ui.ctx().animate_value_with_time(id, o.live_midi.unwrap_or(60.0), 0.1);
+    if on > 0.01 && (NOTE_MIN as f32..=NOTE_MAX as f32).contains(&lm) {
+        let x = col_x(lm);
+        painter.line_segment([pos2(x, chart.top() - 4.0), pos2(x, chart.bottom())], Stroke::new(1.2_f32, fade(p.text, 0.6 * on)));
+        painter.circle_filled(pos2(x, chart.top() - 4.0), 4.0 + 1.5 * on, fade(p.text, on));
+    }
+
+    // hover details
+    if let Some(pos) = resp.hover_pos() {
+        if chart.expand2(vec2(0.0, 40.0)).contains(pos) {
+            let i = (((pos.x - chart.left()) / colw).floor() as isize).clamp(0, n as isize - 1) as usize;
+            let ns = &o.notes[i];
+            let name = midi_name(NOTE_MIN + i as i32);
+            let text = if ns.secs <= 0.0 {
+                format!("{name}: not sung yet")
+            } else {
+                let sum = (ns.chest + ns.mix + ns.head).max(1e-6);
+                format!(
+                    "{name}: {:.1} s\nchest {}%  mix {}%  head {}%{}",
+                    ns.secs,
+                    (ns.chest / sum * 100.0).round(),
+                    (ns.mix / sum * 100.0).round(),
+                    (ns.head / sum * 100.0).round(),
+                    if ns.cracks > 0.0 { format!("\ncracked here {}x", ns.cracks as u32) } else { String::new() }
+                )
+            };
+            resp.on_hover_text_at_pointer(text);
+        }
+    }
+}
+
+// ---------- skill web ----------
+
+/// Radar chart of the skill axes. It starts as a dot in the middle and grows
+/// outward as the app learns about your voice. Hollow dots mean "not enough
+/// data yet".
+pub fn skill_web(ui: &mut Ui, p: &Pal, axes: &[AxisView], size: f32, grow: f32) {
+    let n = axes.len().max(3);
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width().min(size * 1.45), size), Sense::hover());
+    let painter = ui.painter_at(rect.expand(4.0));
+    let center = rect.center() + vec2(0.0, 2.0);
+    let radius = (size * 0.5 - 40.0).max(40.0);
+    let ang = |i: usize| -std::f32::consts::FRAC_PI_2 + std::f32::consts::TAU * i as f32 / n as f32;
+    let at = |i: usize, r: f32| center + vec2(ang(i).cos(), ang(i).sin()) * (radius * r);
+
+    // rings and spokes, very light
+    for (k, f) in [0.25f32, 0.5, 0.75, 1.0].iter().enumerate() {
+        let pts: Vec<Pos2> = (0..=n).map(|i| at(i % n, *f)).collect();
+        let a = if k == 3 { 0.9 } else { 0.5 };
+        painter.add(Shape::line(pts, Stroke::new(if k == 3 { 1.0_f32 } else { 0.6_f32 }, fade(p.stroke, a))));
+    }
+    for i in 0..n {
+        painter.line_segment([center, at(i, 1.0)], Stroke::new(0.6_f32, fade(p.stroke, 0.6)));
+    }
+
+    // animated radii: they glide to new values and grow out when the tab opens
+    let ease = 1.0 - (1.0 - grow.clamp(0.0, 1.0)).powi(3);
+    let id = ui.id().with("web");
+    let vals: Vec<f32> = axes
+        .iter()
+        .enumerate()
+        .map(|(i, a)| ui.ctx().animate_value_with_time(id.with(i), a.value.clamp(0.0, 1.0), 0.8) * ease)
+        .collect();
+    let r_of = |i: usize| 0.03 + 0.97 * vals[i];
+
+    // soft fill (a triangle fan, so the shape may be concave)
+    let mut mesh = egui::Mesh::default();
+    let fill = fade(p.text, 0.11);
+    mesh.colored_vertex(center, fill);
+    for i in 0..axes.len() {
+        mesh.colored_vertex(at(i, r_of(i)), fill);
+    }
+    for i in 0..axes.len() {
+        mesh.add_triangle(0, 1 + i as u32, 1 + ((i + 1) % axes.len()) as u32);
+    }
+    painter.add(Shape::mesh(mesh));
+    let outline: Vec<Pos2> = (0..=axes.len()).map(|i| at(i % axes.len(), r_of(i % axes.len()))).collect();
+    painter.add(Shape::line(outline, Stroke::new(2.0_f32, p.text)));
+
+    // vertices and labels
+    let f = FontId::new(12.5, bold());
+    for (i, a) in axes.iter().enumerate() {
+        let v = at(i, r_of(i));
+        if a.confidence >= 0.3 {
+            painter.circle_filled(v, 4.0, p.text);
+        } else {
+            painter.circle_filled(v, 4.0, p.card);
+            painter.circle_stroke(v, 4.0, Stroke::new(1.5_f32, fade(p.text, 0.6)));
+        }
+        let lp = at(i, 1.0) + vec2(ang(i).cos(), ang(i).sin()) * 14.0;
+        let cos = ang(i).cos();
+        let align = if cos > 0.3 {
+            Align2::LEFT_CENTER
+        } else if cos < -0.3 {
+            Align2::RIGHT_CENTER
+        } else if ang(i).sin() < 0.0 {
+            Align2::CENTER_BOTTOM
+        } else {
+            Align2::CENTER_TOP
+        };
+        let col = if a.confidence >= 0.3 { p.text } else { p.muted };
+        let label_rect = painter.text(lp, align, a.name, f.clone(), col);
+        let hit = label_rect.union(Rect::from_center_size(v, vec2(16.0, 16.0))).expand(4.0);
+        let tip = format!("{}\n{}% so far{}", a.hint, (a.value * 100.0).round(), if a.confidence < 0.3 { " (still learning)" } else { "" });
+        ui.interact(hit, id.with(("hit", i)), Sense::hover()).on_hover_text(tip);
     }
 }

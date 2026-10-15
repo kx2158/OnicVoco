@@ -3,11 +3,14 @@ use crate::analyzer::{Analyzer, LiveFrame, FRAME};
 use crate::audio::{self, AudioInput, Player};
 use crate::content::{GUIDES, PASSAGES, QUICK_PHRASES};
 use crate::dsp::cracks::Crack;
-use crate::dsp::notes::{format_cents, hz_to_note, note_name};
+use crate::dsp::notes::{format_cents, hz_to_midi, hz_to_note, midi_name, note_name};
+use crate::dsp::undertone;
+use crate::profile::{self, Profile, NOTE_MIN};
 use crate::session::{self, find_passaggio, resonance_word, Frame, Goal, Passaggio, Stats, Target};
 use crate::storage::{self, HistoryEntry, Settings};
 use crate::theme::{self, bold, Pal};
-use crate::widgets::{self, card, chip, ghost_button, muted, primary_button, segmented, title, Mood, View};
+use crate::widgets::{self, card, chip, ghost_button, muted, primary_button, segmented, title, Mood, RangeOpts, View};
+use chrono::Datelike;
 use eframe::egui::{self, vec2, Align, Key, Layout, RichText, Ui};
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -18,14 +21,16 @@ enum Tab {
     Practice,
     Read,
     Learn,
+    Range,
     Progress,
     Settings,
 }
 
-const TABS: [(Tab, &str); 5] = [
+const TABS: [(Tab, &str); 6] = [
     (Tab::Practice, "Practice"),
     (Tab::Read, "Read"),
     (Tab::Learn, "Learn"),
+    (Tab::Range, "Range"),
     (Tab::Progress, "Progress"),
     (Tab::Settings, "Settings"),
 ];
@@ -45,6 +50,17 @@ struct Running {
     frames: Vec<Frame>,
     points: Vec<(f32, Option<f32>)>,
     cracks: Vec<Crack>,
+}
+
+/// A guided "map my range" glide.
+struct MapRun {
+    cand: Option<(i32, f32)>,
+    low: Option<i32>,
+    high: Option<i32>,
+}
+
+fn today() -> i64 {
+    chrono::Local::now().date_naive().num_days_from_ce() as i64
 }
 
 struct Summary {
@@ -105,6 +121,14 @@ pub struct App {
     ai_installed: bool,
     ai_message: Option<String>,
 
+    // voice profile: range map + skill web
+    profile: Profile,
+    profile_saved: Instant,
+    map_run: Option<MapRun>,
+    map_result: Option<(i32, i32)>,
+    confirm_web: bool,
+    confirm_range: bool,
+
     guide: usize,
     phrase: usize,
     confirm_clear: bool,
@@ -155,6 +179,12 @@ impl App {
             ai_state: AiState::Idle,
             ai_installed: ai::installed(),
             ai_message: None,
+            profile: storage::load_profile(),
+            profile_saved: now,
+            map_run: None,
+            map_result: None,
+            confirm_web: false,
+            confirm_range: false,
             guide: 0,
             phrase: 0,
             confirm_clear: false,
@@ -190,7 +220,7 @@ impl App {
     // ---------- microphone ----------
 
     fn want_mic(&self) -> bool {
-        self.running.is_some() || (self.settings.live_mic && matches!(self.tab, Tab::Practice | Tab::Read))
+        self.running.is_some() || (self.settings.live_mic && matches!(self.tab, Tab::Practice | Tab::Read | Tab::Range))
     }
 
     fn open_mic(&mut self) -> Result<(), String> {
@@ -252,6 +282,31 @@ impl App {
         }
 
         let target = self.target();
+        let dt = (t - self.live.t).clamp(0.0, 0.1);
+        let web = self.map_run.is_none() && self.running.as_ref().map_or(true, |r| r.mode == Mode::Practice);
+        self.profile.observe_with(&f, dt, &target, today(), web);
+        let mut touched = None;
+        if let Some(m) = self.map_run.as_mut() {
+            match f.hz.map(|h| hz_to_midi(h).round() as i32) {
+                Some(n) => {
+                    // a note counts once it has been steady for a few frames
+                    let held = match m.cand {
+                        Some((c, s)) if c == n => s + dt,
+                        _ => dt,
+                    };
+                    m.cand = Some((n, held));
+                    if held >= 0.1 {
+                        m.low = Some(m.low.map_or(n, |l| l.min(n)));
+                        m.high = Some(m.high.map_or(n, |h| h.max(n)));
+                        touched = Some(n);
+                    }
+                }
+                None => m.cand = None,
+            }
+        }
+        if let Some(n) = touched {
+            self.profile.touch(n);
+        }
         match f.hz {
             Some(h) if target.contains(h) => {
                 self.in_range_since.get_or_insert_with(Instant::now);
@@ -360,6 +415,25 @@ impl App {
                 });
             }
         }
+    }
+
+    fn start_map(&mut self) {
+        self.error = None;
+        self.map_result = None;
+        self.map_run = Some(MapRun { cand: None, low: None, high: None });
+    }
+
+    fn finish_map(&mut self) {
+        if let Some(m) = self.map_run.take() {
+            self.map_result = m.low.zip(m.high).filter(|(a, b)| b > a);
+            self.save_profile();
+        }
+    }
+
+    fn save_profile(&mut self) {
+        storage::save_profile(&self.profile);
+        self.profile.dirty = false;
+        self.profile_saved = Instant::now();
     }
 
     fn toggle_play(&mut self) {
@@ -624,6 +698,7 @@ impl App {
 
         ui.columns(2, |cols| {
             self.live_card(&mut cols[0], &target);
+            self.undertone_card(&mut cols[0]);
             self.register_card(&mut cols[1]);
             self.resonance_card(&mut cols[1], &target);
         });
@@ -702,6 +777,36 @@ impl App {
                     ctx.request_repaint();
                 }
             }
+        });
+    }
+
+    fn undertone_card(&mut self, ui: &mut Ui) {
+        let p = self.pal;
+        let active = self.audio.is_some();
+        let under = self.live.under;
+        card(ui, &p, |ui| {
+            ui.horizontal(|ui| {
+                title(ui, "Undertones");
+                chip(ui, &p, "estimate", false);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if let (Some(u), true) = (under, active) {
+                        if u.fry > 0.6 {
+                            muted(ui, &p, format!("creak around {} Hz", u.f0.round()));
+                        }
+                    }
+                });
+            });
+            widgets::undertone_monitor(ui, &p, under.as_ref(), active);
+            let msg = match (&under, active) {
+                (Some(u), true) => undertone::describe(u),
+                _ => "Make a sound and the spectrum lights up.",
+            };
+            ui.label(RichText::new(msg).size(13.5));
+            muted(
+                ui,
+                &p,
+                "The bars show your sound around the pitch. Tall bars at \"half\" are sub-harmonics (a rough, rattly edge). Roughness needs a pitch above about 130 Hz to measure.",
+            );
         });
     }
 
@@ -1037,8 +1142,211 @@ impl App {
 
     // ---------- Progress ----------
 
+    // ---------- Range ----------
+
+    fn range_tab(&mut self, ui: &mut Ui) {
+        let p = self.pal;
+        let target = self.target();
+        self.error_banner(ui);
+        let mapping = self.map_run.is_some();
+
+        card(ui, &p, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.vertical(|ui| {
+                    title(ui, "Vocal range");
+                    ui.set_max_width(520.0);
+                    muted(
+                        ui,
+                        &p,
+                        "Your range fills in on its own whenever the mic is live. For a quick full map, press Map my range and glide from your lowest note to your highest.",
+                    );
+                    ui.add_space(4.0);
+                    self.mic_combo(ui);
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if !mapping {
+                        if primary_button(ui, &p, "Map my range", false).clicked() {
+                            self.start_map();
+                        }
+                    } else if primary_button(ui, &p, "■  Done", true).clicked() {
+                        self.finish_map();
+                    }
+                });
+            });
+        });
+
+        if let Some(m) = &self.map_run {
+            let (low, high) = (m.low, m.high);
+            card(ui, &p, |ui| {
+                title(ui, "Mapping your range");
+                ui.label("On a quiet \"oo\" or \"ng\", glide slowly from your lowest comfortable note up to your highest, then press Done. Stay gentle: never push past what feels easy.");
+                ui.horizontal(|ui| {
+                    let cur = self.live.hz.map(|h| hz_to_note(h).name).unwrap_or_else(|| "--".into());
+                    ui.label(RichText::new(cur).family(bold()).size(34.0));
+                    ui.add_space(16.0);
+                    match low.zip(high) {
+                        Some((a, b)) => muted(ui, &p, format!("so far {} to {}", midi_name(a), midi_name(b))),
+                        None => muted(ui, &p, "waiting for your voice…"),
+                    }
+                });
+            });
+        } else if let Some((a, b)) = self.map_result {
+            card(ui, &p, |ui| {
+                ui.horizontal(|ui| {
+                    title(ui, "Last glide");
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ghost_button(ui, &p, "Close").clicked() {
+                            self.map_result = None;
+                        }
+                    });
+                });
+                ui.label(RichText::new(format!("{} to {}", midi_name(a), midi_name(b))).family(bold()).size(30.0));
+                muted(ui, &p, span_text(b - a));
+            });
+        }
+
+        let range = self.profile.range();
+        let comfort = self.profile.comfort_zone();
+        let session = self.map_run.as_ref().and_then(|m| m.low.zip(m.high));
+        let live_midi = self.live.hz.map(hz_to_midi);
+        let grow = (self.tab_changed.elapsed().as_secs_f32() / 1.0).min(1.0);
+        if grow < 1.0 {
+            ui.ctx().request_repaint();
+        }
+        card(ui, &p, |ui| {
+            ui.horizontal(|ui| {
+                title(ui, "Range map");
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    muted(ui, &p, "bar height = time on each note · ◯ = crack · shaded = goal · line under = comfort zone");
+                });
+            });
+            widgets::range_map(
+                ui,
+                &p,
+                &RangeOpts {
+                    notes: &self.profile.notes,
+                    target: &target,
+                    passaggio: self.settings.passaggio_hz,
+                    live_midi,
+                    session,
+                    range,
+                    comfort,
+                    grow,
+                    height: 230.0,
+                },
+            );
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("■ chest").color(p.text).size(12.5));
+                ui.label(RichText::new("■ mix").color(widgets::fade(p.text, 0.55)).size(12.5));
+                ui.label(RichText::new("■ head / falsetto").color(widgets::fade(p.text, 0.28)).size(12.5));
+            });
+        });
+
+        card(ui, &p, |ui| {
+            title(ui, "Your range");
+            match range {
+                Some((lo, hi)) => {
+                    ui.columns(4, |c| {
+                        stat_tile(&mut c[0], &p, "Lowest", &midi_name(lo));
+                        stat_tile(&mut c[1], &p, "Highest", &midi_name(hi));
+                        stat_tile(&mut c[2], &p, "Span", &span_text(hi - lo));
+                        let cz = comfort.map(|(a, b)| format!("{} to {}", midi_name(a), midi_name(b))).unwrap_or_else(|| "--".into());
+                        stat_tile(&mut c[3], &p, "Comfort zone", &cz);
+                    });
+                    // how much of the goal range has been reached
+                    let g0 = hz_to_midi(target.min_hz).round() as i32;
+                    let g1 = hz_to_midi(target.max_hz).round() as i32;
+                    let total = (g1 - g0 + 1).max(1);
+                    let covered = (g0..=g1)
+                        .filter(|m| self.profile.notes.get((m - NOTE_MIN) as usize).is_some_and(|n| n.mapped()))
+                        .count() as i32;
+                    ui.add_space(6.0);
+                    ui.label(format!(
+                        "You've sounded {covered} of the {total} notes in your {} goal range ({} to {}).",
+                        target.label().to_lowercase(),
+                        midi_name(g0),
+                        midi_name(g1)
+                    ));
+                    let mut hot: Vec<(usize, f32)> =
+                        self.profile.notes.iter().enumerate().filter(|(_, n)| n.cracks > 0.0).map(|(i, n)| (i, n.cracks)).collect();
+                    hot.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                    if !hot.is_empty() {
+                        let list: Vec<String> =
+                            hot.iter().take(3).map(|(i, c)| format!("{} ({}x)", midi_name(NOTE_MIN + *i as i32), *c as u32)).collect();
+                        ui.label(format!("Your voice cracks most around {}. That's your practice zone: quiet, light sirens across it.", list.join(", ")));
+                    }
+                }
+                None => {
+                    muted(ui, &p, "Nothing mapped yet. Sing or speak with the mic live, or press Map my range and glide. A note counts once you've sounded it for a moment.");
+                }
+            }
+            ui.add_space(8.0);
+            let label = if self.confirm_range { "Click again to clear the range map" } else { "Clear range map" };
+            if ghost_button(ui, &p, label).clicked() {
+                if self.confirm_range {
+                    self.profile.reset_range();
+                    self.map_result = None;
+                    self.save_profile();
+                }
+                self.confirm_range = !self.confirm_range;
+            }
+        });
+    }
+
+    // ---------- Progress ----------
+
+    fn web_card(&mut self, ui: &mut Ui) {
+        let p = self.pal;
+        let day = today();
+        let axes = self.profile.axes(day);
+        let hl = self.profile.highlights(day);
+        let grow = (self.tab_changed.elapsed().as_secs_f32() / 1.1).min(1.0);
+        if grow < 1.0 {
+            ui.ctx().request_repaint();
+        }
+        let minutes = (self.profile.total_secs() / 60.0).round() as u32;
+        card(ui, &p, |ui| {
+            ui.horizontal(|ui| {
+                title(ui, "Your voice web");
+                chip(ui, &p, "builds as you practise", false);
+            });
+            ui.horizontal_top(|ui| {
+                widgets::skill_web(ui, &p, &axes, 340.0, grow);
+                ui.add_space(12.0);
+                ui.vertical(|ui| {
+                    ui.set_min_width(240.0);
+                    match hl {
+                        Some((best, worst)) => {
+                            muted(ui, &p, "Strongest right now");
+                            ui.label(RichText::new(axes[best].name).family(bold()).size(22.0));
+                            ui.add_space(6.0);
+                            muted(ui, &p, "Most room to grow");
+                            ui.label(RichText::new(axes[worst].name).family(bold()).size(22.0));
+                            ui.label(profile::focus_tip(worst));
+                        }
+                        None => {
+                            ui.label("Keep the mic live while you practise and the web grows on its own. After a few minutes of voice it can start to say what's strong and what has room to grow.");
+                        }
+                    }
+                    ui.add_space(8.0);
+                    muted(ui, &p, format!("{minutes} min of voice so far · filled dot = enough data, hollow = still learning · hover an axis for what it means"));
+                    ui.add_space(6.0);
+                    let label = if self.confirm_web { "Click again to start over" } else { "Start the web over" };
+                    if ghost_button(ui, &p, label).clicked() {
+                        if self.confirm_web {
+                            self.profile.reset_web();
+                            self.save_profile();
+                        }
+                        self.confirm_web = !self.confirm_web;
+                    }
+                });
+            });
+        });
+    }
+
     fn progress(&mut self, ui: &mut Ui) {
         let p = self.pal;
+        self.web_card(ui);
         if self.history.is_empty() {
             card(ui, &p, |ui| {
                 title(ui, "Progress");
@@ -1217,13 +1525,39 @@ fn trend(ui: &mut Ui, p: &Pal, pts: &[f32], height: f32) {
     }
 }
 
+fn span_text(semitones: i32) -> String {
+    let (o, st) = (semitones / 12, semitones % 12);
+    match (o, st) {
+        (0, st) => format!("{st} semitones"),
+        (o, 0) => format!("{o} octave{}", if o == 1 { "" } else { "s" }),
+        (o, st) => format!("{o} oct + {st} st"),
+    }
+}
+
+fn stat_tile(ui: &mut Ui, p: &Pal, label: &str, value: &str) {
+    ui.vertical(|ui| {
+        muted(ui, p, label);
+        ui.label(RichText::new(value).family(bold()).size(22.0));
+    });
+}
+
 impl eframe::App for App {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.save_profile();
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.refresh_theme(ctx, false);
         self.manage_mic();
         self.tick_audio(ctx);
         self.poll_player(ctx);
         self.poll_ai();
+        if self.tab != Tab::Range && self.map_run.is_some() {
+            self.finish_map();
+        }
+        if self.profile.dirty && self.profile_saved.elapsed() > Duration::from_secs(12) {
+            self.save_profile();
+        }
         if !matches!(self.ai_state, AiState::Idle) {
             ctx.request_repaint_after(Duration::from_millis(200));
         }
@@ -1256,6 +1590,7 @@ impl eframe::App for App {
                         Tab::Practice => self.practice(ui),
                         Tab::Read => self.read(ui),
                         Tab::Learn => self.learn(ui),
+                        Tab::Range => self.range_tab(ui),
                         Tab::Progress => self.progress(ui),
                         Tab::Settings => self.settings_tab(ui, ctx),
                     }
