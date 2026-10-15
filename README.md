@@ -64,7 +64,7 @@ $env:RUSTFLAGS="-C target-feature=-crt-static"; cargo build --release -p onicvoc
 
 ## Releasing
 
-Actions tab > **Release** > **Run workflow**, enter a version like `0.2.0`. It builds the installer and portable exe and creates a draft release to review and publish.
+Actions tab > **Release** > **Run workflow**, enter a version like `0.2.0`. It builds the installer and portable exe and creates a draft release. Check it, then run **Publish release** with the same version to make it public and the latest (the AI coach download uses the latest release).
 
 ## Project layout
 

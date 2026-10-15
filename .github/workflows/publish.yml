@@ -1,0 +1,26 @@
+# Publishes a draft release made by release.yml and marks it as the latest,
+# so the app's "Download AI coach" can fetch the helper from it.
+# Run it from the Actions tab: Publish release > Run workflow.
+
+name: Publish release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish (without the v), e.g. 0.3.0'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish and mark as latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release edit "v${{ inputs.version }}" --repo "${{ github.repository }}" --draft=false --prerelease=false --latest
+          gh release view "v${{ inputs.version }}" --repo "${{ github.repository }}" --json tagName,isDraft,isPrerelease
